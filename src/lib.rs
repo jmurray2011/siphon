@@ -1,10 +1,11 @@
 //! siphon mirrors HTTP APIs into a local database, scheduling its own polling
 //! against a continuously measured rate-limit budget.
 //!
-//! The crate is split into a deterministic core and a thin I/O edge. The core
-//! has no sockets, no filesystem and no wall clock except through
-//! [`clock::Clock`], which is what lets scheduling behaviour be tested by
-//! simulation rather than by sleeping.
+//! The crate is split into a deterministic core and a thin I/O edge:
+//!
+//! - [`clock`], [`config`], [`pagination`], [`budget`], [`governor`], [`extract`]
+//!   are pure: no sockets, no filesystem, no wall clock except through [`clock::Clock`].
+//! - [`http`], [`store`] are adapters.
 //!
 //! The governor ([`governor`]) is the piece that distinguishes siphon: it treats
 //! the remaining rate-limit budget as a resource to allocate across streams that
@@ -15,4 +16,6 @@ pub mod clock;
 pub mod config;
 pub mod extract;
 pub mod governor;
+pub mod http;
 pub mod pagination;
+pub mod store;
