@@ -33,8 +33,27 @@ pub struct CursorConfig {
     #[serde(rename = "type")]
     pub kind: CursorKind,
     /// Query parameter the high-water mark is injected into on the next sync.
+    ///
+    /// Mutually exclusive with a `{{ cursor }}` placeholder in `request.params`,
+    /// which is what an API with a query language needs instead.
     #[serde(default)]
     pub param: Option<String>,
+    /// How to write the high-water mark back, as a `strftime` pattern.
+    ///
+    /// APIs routinely accept a narrower timestamp format than they emit. Jira
+    /// is the canonical case: it returns `2021-05-04T22:10:32.221+0100` but its
+    /// query language accepts only `2021-05-04 22:10` - and feeding it the
+    /// wider form is *accepted* and silently matches nothing, so getting this
+    /// wrong looks exactly like a healthy stream with no new data.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// The mark to use before anything has been stored.
+    ///
+    /// Required when `request.params` interpolates `{{ cursor }}`, because
+    /// there is no sensible way to render a placeholder for a mark that does
+    /// not exist yet.
+    #[serde(default)]
+    pub initial: Option<String>,
 }
 
 /// How a cursor value is interpreted.
@@ -42,6 +61,12 @@ pub struct CursorConfig {
 #[serde(rename_all = "snake_case")]
 pub enum CursorKind {
     /// An RFC 3339 timestamp.
+    ///
+    /// The basic-format offset that Java-based APIs emit (`+0100` rather than
+    /// `+01:00`) is accepted too. It is not strictly RFC 3339, but rejecting it
+    /// means the high-water mark silently never advances, and a mirror that
+    /// re-walks its whole history forever while reporting success is a worse
+    /// outcome than a liberal parser.
     Rfc3339,
     /// Unix seconds.
     UnixSeconds,
@@ -51,6 +76,26 @@ pub enum CursorKind {
     Integer,
     /// An opaque string, compared lexicographically.
     String,
+}
+
+impl CursorKind {
+    /// True when values of this kind denote an instant, and so can be reformatted.
+    #[must_use]
+    pub const fn is_timestamp(self) -> bool {
+        matches!(self, Self::Rfc3339 | Self::UnixSeconds | Self::UnixMillis)
+    }
+
+    /// The label used in config and error messages.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rfc3339 => "rfc3339",
+            Self::UnixSeconds => "unix_seconds",
+            Self::UnixMillis => "unix_millis",
+            Self::Integer => "integer",
+            Self::String => "string",
+        }
+    }
 }
 
 /// A validated `records` block.
@@ -67,6 +112,8 @@ pub struct CursorSpec {
     path: JsonPath,
     kind: CursorKind,
     param: Option<String>,
+    format: Option<String>,
+    initial: Option<String>,
 }
 
 impl CursorSpec {
@@ -81,6 +128,19 @@ impl CursorSpec {
     pub const fn kind(&self) -> CursorKind {
         self.kind
     }
+
+    /// The `strftime` pattern the high-water mark is written back in, if the
+    /// API wants something narrower than it emits.
+    #[must_use]
+    pub fn format(&self) -> Option<&str> {
+        self.format.as_deref()
+    }
+
+    /// The mark to use before anything has been stored.
+    #[must_use]
+    pub fn initial(&self) -> Option<&str> {
+        self.initial.as_deref()
+    }
 }
 
 /// Why a `records` block could not be validated.
@@ -94,6 +154,18 @@ pub enum RecordSpecError {
         /// The parse failure.
         #[source]
         source: serde_json_path::ParseError,
+    },
+    /// The `strftime` pattern in `cursor.format` is not valid.
+    #[error("records `cursor.format` is not a valid strftime pattern: `{pattern}`")]
+    BadFormat {
+        /// What was written.
+        pattern: String,
+    },
+    /// `cursor.format` was set on a cursor that is not a timestamp.
+    #[error("records `cursor.format` only applies to timestamp cursors, not `{kind}`")]
+    FormatNotApplicable {
+        /// The cursor type it was set on.
+        kind: &'static str,
     },
 }
 
@@ -137,10 +209,28 @@ impl RecordSpec {
                 .cursor
                 .as_ref()
                 .map(|c| {
+                    if let Some(pattern) = &c.format {
+                        if !c.kind.is_timestamp() {
+                            return Err(RecordSpecError::FormatNotApplicable {
+                                kind: c.kind.as_str(),
+                            });
+                        }
+                        // chrono panics when formatting with a bad pattern, so
+                        // the pattern is checked here rather than mid-run.
+                        if chrono::format::StrftimeItems::new(pattern)
+                            .any(|item| matches!(item, chrono::format::Item::Error))
+                        {
+                            return Err(RecordSpecError::BadFormat {
+                                pattern: pattern.clone(),
+                            });
+                        }
+                    }
                     Ok::<_, RecordSpecError>(CursorSpec {
                         path: parse_path(&c.field, "cursor.field")?,
                         kind: c.kind,
                         param: c.param.clone(),
+                        format: c.format.clone(),
+                        initial: c.initial.clone(),
                     })
                 })
                 .transpose()?,
@@ -327,11 +417,7 @@ impl CursorValue {
     #[must_use]
     pub fn parse(raw: &str, kind: CursorKind) -> Option<Self> {
         let ord = match kind {
-            CursorKind::Rfc3339 => CursorOrd::Num(
-                chrono::DateTime::parse_from_rfc3339(raw)
-                    .ok()?
-                    .timestamp_millis(),
-            ),
+            CursorKind::Rfc3339 => CursorOrd::Num(parse_timestamp(raw)?.timestamp_millis()),
             CursorKind::UnixSeconds => CursorOrd::Num(raw.parse::<i64>().ok()?.checked_mul(1_000)?),
             CursorKind::UnixMillis | CursorKind::Integer => CursorOrd::Num(raw.parse().ok()?),
             CursorKind::String => CursorOrd::Text(raw.to_owned()),
@@ -358,6 +444,49 @@ impl CursorValue {
             self
         }
     }
+
+    /// The mark as the API wants it written back.
+    ///
+    /// Without a `format` this is the value exactly as it arrived, which is
+    /// what an API that round-trips its own cursor expects. With one, the
+    /// instant is re-rendered - in the offset it arrived in, so a mark that
+    /// meant 22:10 local does not come back meaning 21:10.
+    #[must_use]
+    pub fn render(&self, spec: &CursorSpec) -> String {
+        let Some(pattern) = spec.format() else {
+            return self.raw.clone();
+        };
+        match spec.kind() {
+            CursorKind::Rfc3339 => parse_timestamp(&self.raw)
+                .map(|at| at.format(pattern).to_string())
+                .unwrap_or_else(|| self.raw.clone()),
+            CursorKind::UnixSeconds | CursorKind::UnixMillis => {
+                let millis = match self.ord {
+                    CursorOrd::Num(millis) => millis,
+                    CursorOrd::Text(_) => return self.raw.clone(),
+                };
+                chrono::DateTime::from_timestamp_millis(millis)
+                    .map(|at| at.format(pattern).to_string())
+                    .unwrap_or_else(|| self.raw.clone())
+            }
+            CursorKind::Integer | CursorKind::String => self.raw.clone(),
+        }
+    }
+}
+
+/// Parses a timestamp, accepting both RFC 3339 and the basic-format offsets
+/// that Java-based APIs emit.
+///
+/// `2021-05-04T22:10:32.221+0100` is not RFC 3339 - the offset needs a colon -
+/// but Jira, Confluence and a long tail of Java stacks send exactly that.
+fn parse_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(at);
+    }
+    const FALLBACKS: [&str; 2] = ["%Y-%m-%dT%H:%M:%S%.f%z", "%Y-%m-%d %H:%M:%S%.f%z"];
+    FALLBACKS
+        .iter()
+        .find_map(|format| chrono::DateTime::parse_from_str(raw, format).ok())
 }
 
 #[cfg(test)]
@@ -373,9 +502,29 @@ mod tests {
                 field: field.to_owned(),
                 kind,
                 param: Some("since".to_owned()),
+                format: None,
+                initial: None,
             }),
         })
         .unwrap()
+    }
+
+    fn cursor_spec(kind: CursorKind, format: Option<&str>) -> CursorSpec {
+        RecordSpec::from_config(&RecordsConfig {
+            path: "$".to_owned(),
+            primary_key: "$.id".to_owned(),
+            cursor: Some(CursorConfig {
+                field: "$.updated".to_owned(),
+                kind,
+                param: None,
+                format: format.map(str::to_owned),
+                initial: None,
+            }),
+        })
+        .unwrap()
+        .cursor()
+        .cloned()
+        .expect("cursor was configured")
     }
 
     fn at() -> Timestamp {
@@ -510,6 +659,118 @@ mod tests {
 
         assert_eq!(first[0].payload_hash(), same[0].payload_hash());
         assert_ne!(first[0].payload_hash(), changed[0].payload_hash());
+    }
+
+    #[test]
+    fn a_basic_format_offset_still_parses() {
+        // Jira, Confluence and a long tail of Java stacks emit `+0100` rather
+        // than `+01:00`. Rejecting it means the high-water mark never advances
+        // and the mirror re-walks its whole history forever, reporting success.
+        let jira = CursorValue::parse("2021-05-04T22:10:32.221+0100", CursorKind::Rfc3339)
+            .expect("a basic-format offset should parse");
+        let rfc = CursorValue::parse("2021-05-04T22:10:32.221+01:00", CursorKind::Rfc3339)
+            .expect("rfc 3339 should parse");
+
+        // The two spellings denote the same instant, so neither is "later" and
+        // a tie leaves the stored mark alone rather than churning it.
+        assert_eq!(jira.ord, rfc.ord);
+        assert_eq!(jira.clone().max(rfc).as_str(), jira.as_str());
+
+        // And it orders correctly against a genuinely later mark.
+        let later =
+            CursorValue::parse("2021-05-04T23:10:32.221+0100", CursorKind::Rfc3339).unwrap();
+        assert_eq!(jira.max(later.clone()).as_str(), later.as_str());
+    }
+
+    #[test]
+    fn a_space_separated_timestamp_parses_too() {
+        assert!(CursorValue::parse("2021-05-04 22:10:32+0100", CursorKind::Rfc3339).is_some());
+    }
+
+    #[test]
+    fn genuinely_unparseable_timestamps_are_still_rejected() {
+        for raw in ["not a date", "", "2021-13-45T99:99:99Z"] {
+            assert!(
+                CursorValue::parse(raw, CursorKind::Rfc3339).is_none(),
+                "`{raw}` should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cursor_renders_verbatim_when_no_format_is_given() {
+        let spec = cursor_spec(CursorKind::Rfc3339, None);
+        let value =
+            CursorValue::parse("2021-05-04T22:10:32.221+0100", CursorKind::Rfc3339).unwrap();
+        assert_eq!(value.render(&spec), "2021-05-04T22:10:32.221+0100");
+    }
+
+    #[test]
+    fn a_format_narrows_the_mark_to_what_the_api_accepts() {
+        // The exact shape Jira's query language wants.
+        let spec = cursor_spec(CursorKind::Rfc3339, Some("%Y-%m-%d %H:%M"));
+        let value =
+            CursorValue::parse("2021-05-04T22:10:32.221+0100", CursorKind::Rfc3339).unwrap();
+        assert_eq!(value.render(&spec), "2021-05-04 22:10");
+    }
+
+    #[test]
+    fn rendering_keeps_the_offset_the_mark_arrived_in() {
+        // Re-rendering in UTC would turn 22:10+0100 into 21:10 and quietly
+        // re-fetch an extra hour of history on every run.
+        let spec = cursor_spec(CursorKind::Rfc3339, Some("%Y-%m-%d %H:%M"));
+        let value =
+            CursorValue::parse("2021-05-04T22:10:32.221+0100", CursorKind::Rfc3339).unwrap();
+        assert_eq!(value.render(&spec), "2021-05-04 22:10");
+
+        let utc = CursorValue::parse("2021-05-04T22:10:32.221Z", CursorKind::Rfc3339).unwrap();
+        assert_eq!(utc.render(&spec), "2021-05-04 22:10");
+    }
+
+    #[test]
+    fn unix_cursors_can_be_reformatted_as_dates() {
+        let spec = cursor_spec(CursorKind::UnixSeconds, Some("%Y-%m-%d"));
+        let value = CursorValue::parse("1620166232", CursorKind::UnixSeconds).unwrap();
+        assert_eq!(value.render(&spec), "2021-05-04");
+    }
+
+    #[test]
+    fn a_format_on_a_non_timestamp_cursor_is_refused() {
+        let err = RecordSpec::from_config(&RecordsConfig {
+            path: "$".to_owned(),
+            primary_key: "$.id".to_owned(),
+            cursor: Some(CursorConfig {
+                field: "$.seq".to_owned(),
+                kind: CursorKind::Integer,
+                param: None,
+                format: Some("%Y-%m-%d".to_owned()),
+                initial: None,
+            }),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RecordSpecError::FormatNotApplicable { kind: "integer" }
+        ));
+    }
+
+    #[test]
+    fn a_bad_strftime_pattern_is_caught_at_load_not_mid_run() {
+        // chrono panics when formatting with a bad pattern, so this has to fail
+        // before a run rather than during one.
+        let err = RecordSpec::from_config(&RecordsConfig {
+            path: "$".to_owned(),
+            primary_key: "$.id".to_owned(),
+            cursor: Some(CursorConfig {
+                field: "$.updated".to_owned(),
+                kind: CursorKind::Rfc3339,
+                param: None,
+                format: Some("%Q".to_owned()),
+                initial: None,
+            }),
+        })
+        .unwrap_err();
+        assert!(matches!(err, RecordSpecError::BadFormat { .. }));
     }
 
     #[test]
