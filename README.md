@@ -210,6 +210,43 @@ streams:
       mode: upsert
 ```
 
+### Incremental marks on APIs with a query language
+
+Some APIs do not take a `since` parameter; the mark is one clause of an
+expression - JQL, SOQL, an OData `$filter`. Interpolate `{{ cursor }}` into the
+parameter instead of declaring `cursor.param`:
+
+```yaml
+    request:
+      path: /rest/api/3/search/jql
+      params:
+        jql: 'project = {{ project }} AND updated >= "{{ cursor }}" ORDER BY updated ASC'
+    records:
+      cursor:
+        field: $.fields.updated
+        type: rfc3339
+        format: "%Y-%m-%d %H:%M"    # how to write the mark back
+        initial: "1970-01-01 00:00" # the mark before anything is stored
+```
+
+`format` exists because APIs routinely accept a narrower timestamp than they
+emit, and the failure when they do is silent. Jira returns
+`2021-05-04T22:10:32.221+0100`; feeding that straight back into JQL is
+**accepted and matches nothing**, so a stream would report `ok` forever while
+mirroring no new data. The mark is stored exactly as it arrived and narrowed
+only on the way out, in the offset it arrived in - re-rendering in UTC would
+silently re-fetch an extra hour of history every run.
+
+`initial` is required whenever `{{ cursor }}` is used: the first run has no
+stored mark, and there is nothing sensible to substitute. Declaring both
+`{{ cursor }}` and `cursor.param` is refused rather than guessed at.
+
+The `rfc3339` type also accepts the basic-format offset that Java-based APIs
+emit (`+0100` rather than `+01:00`). That is not strictly RFC 3339, but
+rejecting it means the mark never advances and the mirror re-walks its whole
+history forever while reporting success - a much worse failure than a liberal
+parser.
+
 ### Pagination strategies
 
 | Strategy | Required | Termination |

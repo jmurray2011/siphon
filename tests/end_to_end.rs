@@ -184,6 +184,119 @@ async fn a_second_sync_sends_the_stored_cursor_and_upserts_rather_than_duplicati
     );
 }
 
+/// A stream shaped like an API whose filter is a query language: the mark is a
+/// clause inside one parameter, and the API accepts a narrower timestamp than
+/// it emits.
+const QUERY_LANGUAGE_STREAM: &str = r#"  - name: issues
+    source: api
+    freshness: 15m
+    request:
+      path: /search
+      params:
+        query: 'project = {{ project }} AND updated >= "{{ cursor }}" ORDER BY updated ASC'
+    vars:
+      project: ABC
+    pagination:
+      strategy: cursor
+      cursor_param: nextPageToken
+      cursor_path: $.nextPageToken
+    records:
+      path: $.issues
+      primary_key: $.key
+      cursor:
+        field: $.fields.updated
+        type: rfc3339
+        format: "%Y-%m-%d %H:%M"
+        initial: "1970-01-01 00:00"
+"#;
+
+#[tokio::test]
+async fn a_query_language_stream_carries_its_mark_inside_the_query() {
+    let api = MockApi::spawn(|request| {
+        // Only ever answer with issues the query actually asks for. An API that
+        // silently matches nothing on a malformed mark is exactly the failure
+        // this test exists to catch, so the mock is strict about it.
+        let query = request.param("query").unwrap_or_default().to_owned();
+        if !query.contains("project = ABC") {
+            return Reply::status(400);
+        }
+        if query.contains("1970-01-01 00:00") {
+            return Reply::json(
+                r#"{"issues":[{"key":"ABC-1","fields":{"updated":"2021-05-04T22:10:32.221+0100"}}]}"#,
+            );
+        }
+        if query.contains("2021-05-04 22:10") {
+            return Reply::json(r#"{"issues":[]}"#);
+        }
+        // Any other mark means the watermark was rendered wrong.
+        Reply::json(r#"{"issues":[],"unexpected_mark":true}"#)
+    })
+    .await;
+
+    let fixture = fixture(&api.base_url(), QUERY_LANGUAGE_STREAM);
+    let app = app(&fixture).await;
+
+    let first = sync(&app, "issues", false).await;
+    assert_eq!(first.status, RunStatus::Ok, "{first:?}");
+    assert_eq!(first.records_new, 1);
+
+    let second = sync(&app, "issues", false).await;
+    assert_eq!(second.status, RunStatus::Ok, "{second:?}");
+
+    let queries: Vec<String> = api
+        .requests()
+        .iter()
+        .filter_map(|r| r.param("query").map(str::to_owned))
+        .collect();
+
+    assert!(
+        queries[0].contains(r#"updated >= "1970-01-01 00:00""#),
+        "the first run should use the initial mark, got: {}",
+        queries[0]
+    );
+    assert!(
+        queries
+            .last()
+            .is_some_and(|q| q.contains(r#"updated >= "2021-05-04 22:10""#)),
+        "the second run should use the stored mark, narrowed to what the API accepts, got: {:?}",
+        queries.last()
+    );
+
+    // The mark is stored verbatim as the upstream emitted it, and only narrowed
+    // on the way back out - so nothing is lost to the format.
+    let checkpoint = app.store.checkpoint("issues").await.expect("checkpoint");
+    assert_eq!(
+        checkpoint.cursor_val.as_deref(),
+        Some("2021-05-04T22:10:32.221+0100")
+    );
+}
+
+#[tokio::test]
+async fn a_basic_format_offset_still_advances_the_mark() {
+    // The regression this guards: a `+0100` offset that fails to parse leaves
+    // the high-water mark null, so every run re-walks the whole history while
+    // reporting success.
+    let api = MockApi::spawn(|request| {
+        if request.param("query").unwrap_or_default().contains("1970-01-01") {
+            return Reply::json(
+                r#"{"issues":[{"key":"ABC-1","fields":{"updated":"2021-05-04T22:10:32.221+0100"}}]}"#,
+            );
+        }
+        Reply::json(r#"{"issues":[]}"#)
+    })
+    .await;
+
+    let fixture = fixture(&api.base_url(), QUERY_LANGUAGE_STREAM);
+    let app = app(&fixture).await;
+    sync(&app, "issues", false).await;
+
+    let checkpoint = app.store.checkpoint("issues").await.expect("checkpoint");
+    assert!(
+        checkpoint.cursor_val.is_some(),
+        "the mark must advance even when the offset is basic-format"
+    );
+}
+
 #[tokio::test]
 async fn a_crash_mid_pagination_resumes_at_the_next_page() {
     let api = MockApi::spawn(|request| {
