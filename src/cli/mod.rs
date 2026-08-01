@@ -53,7 +53,10 @@ pub enum Command {
     /// Run as a daemon; the governor schedules every stream.
     Run {
         /// Config file, if not the one given by `--config`.
-        config: Option<PathBuf>,
+        // Named apart from the global `--config` so the two argument ids do not
+        // collide, which clap reports as an unexpected `--config`.
+        #[arg(value_name = "CONFIG")]
+        config_file: Option<PathBuf>,
     },
     /// Sync one stream once, bypassing admission.
     Sync {
@@ -74,7 +77,8 @@ pub enum Command {
     /// Parse and check the config. Makes no network calls.
     Validate {
         /// Config file, if not the one given by `--config`.
-        config: Option<PathBuf>,
+        #[arg(value_name = "CONFIG")]
+        config_file: Option<PathBuf>,
     },
     /// Per-stream SLO attainment, lag and budget.
     Status,
@@ -91,9 +95,12 @@ impl Cli {
         init_tracing(self.log_format);
 
         match &self.command {
-            Command::Validate { config } => status::validate(&self.config_path(config.as_deref())),
-            Command::Run { config } => {
-                let app = App::build(&self.config_path(config.as_deref()), Storage::OnDisk).await?;
+            Command::Validate { config_file } => {
+                status::validate(&self.config_path(config_file.as_deref()))
+            }
+            Command::Run { config_file } => {
+                let app =
+                    App::build(&self.config_path(config_file.as_deref()), Storage::OnDisk).await?;
                 run::daemon(app).await
             }
             Command::Sync { stream, full } => {
