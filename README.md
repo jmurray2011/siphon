@@ -66,6 +66,40 @@ Priority biases the ordering; it does not create castes. Deficit grows without
 bound, so a `low` stream that is badly late eventually outranks a `high` stream
 that is barely late - it still got served four times above.
 
+## Does the premise hold?
+
+The whole design rests on `(remaining, reset_at)` being readable reliably enough
+to pace against. If it is not, the governor degrades to a static token bucket and
+there is no reason for siphon to exist. Surveyed against live unauthenticated
+responses on 2026-08-01, captured as fixtures in
+[`tests/real_world_headers.rs`](tests/real_world_headers.rs):
+
+| API | Fields | Reset | Window | Verdict |
+|---|---|---|---|---|
+| GitHub | `X-RateLimit-*` | unix seconds | 3600s | Usable; decrements exactly once per request |
+| GitLab | `RateLimit-*` (IETF) | unix seconds | **60s**, aligned to the minute | Usable from the same parse, no configuration |
+| crates.io | none | - | - | No signal at all |
+| PyPI | none (but sends `ETag`) | - | - | No signal at all |
+
+Two things fell out of this that were not obvious from the design:
+
+**Window length varies by two orders of magnitude.** GitHub's window is an hour;
+GitLab's is a minute. Both are read correctly from the same auto-detected fields,
+but they produce very different pacing - 0.013 req/s against GitHub versus about
+17 req/s against GitLab - and the window estimator has to converge on each
+without being told which it is looking at.
+
+**A configured ceiling is not a fallback, it is a primary path.** Two of the four
+APIs surveyed publish nothing at all. `requests_per_hour` is the only signal
+there, and the politeness floor is what protects an API that has neither.
+Conditional requests are independent of this: PyPI publishes no budget but does
+publish an `ETag`, so polling it is still cheap.
+
+Worth noting for later: GitHub's `X-RateLimit-Resource: core` names the bucket
+the limit belongs to, and `/search` is a separate bucket on the same token. The
+budget model here assumes one pool per source, so a config that mixes them would
+measure one and spend both.
+
 ---
 
 ## Quick start
