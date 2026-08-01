@@ -5,7 +5,7 @@
 //!
 //! - [`clock`], [`config`], [`pagination`], [`budget`], [`governor`], [`extract`]
 //!   are pure: no sockets, no filesystem, no wall clock except through [`clock::Clock`].
-//! - [`http`], [`store`] are adapters.
+//! - [`http`], [`store`] are adapters. [`sync`] wires them together.
 //!
 //! The governor ([`governor`]) is the piece that distinguishes siphon: it treats
 //! the remaining rate-limit budget as a resource to allocate across streams that
@@ -19,3 +19,4 @@ pub mod governor;
 pub mod http;
 pub mod pagination;
 pub mod store;
+pub mod sync;
