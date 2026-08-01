@@ -1,0 +1,101 @@
+# A worked example: mirror a GitHub repository's issues into SQLite.
+#
+#   export GITHUB_TOKEN=ghp_...
+#   siphon validate examples/github.yaml
+#   siphon test issues --config examples/github.yaml
+#   siphon run examples/github.yaml
+
+version: 1
+
+store:
+  type: sqlite
+  path: ./data/mirror.db
+
+defaults:
+  timeout: 30s
+  retry:
+    max_attempts: 5
+    initial_backoff: 1s
+    max_backoff: 5m
+
+sources:
+  github:
+    base_url: https://api.github.com
+    auth:
+      type: bearer
+      token: ${GITHUB_TOKEN}
+    headers:
+      Accept: application/vnd.github+json
+    budget:
+      # Fallback ceiling, used only until the API tells us otherwise.
+      requests_per_hour: 5000
+      # Trust the API's own accounting over the static guess.
+      observe:
+        remaining_header: X-RateLimit-Remaining
+        limit_header: X-RateLimit-Limit
+        reset_header: X-RateLimit-Reset
+        reset_format: unix_seconds
+      # Fraction of the measured budget siphon will actually spend, leaving
+      # headroom for whatever else uses this token.
+      utilization: 0.8
+    # 304s do not decrement GitHub's rate limit, which is what makes an
+    # aggressive freshness target affordable.
+    conditional_requests: true
+
+streams:
+  # Intent, not mechanism: never staler than 15 minutes, and served before
+  # anything else when the budget is tight.
+  - name: issues
+    source: github
+    freshness: 15m
+    priority: high
+    request:
+      path: /repos/{{ owner }}/{{ repo }}/issues
+      params:
+        state: all
+        per_page: 100
+        sort: updated
+        direction: asc
+    vars:
+      owner: rust-lang
+      repo: rust
+    pagination:
+      strategy: link_header
+      rel: next
+    records:
+      path: $
+      primary_key: $.id
+      cursor:
+        field: $.updated_at
+        type: rfc3339
+        param: since
+    write:
+      mode: upsert
+
+  # A historical walk with no deadline. It consumes surplus budget only, and
+  # yields the moment `issues` needs headroom to hold its target. This is the
+  # whole backfill story: not a mode with its own scheduler, just a stream that
+  # eats leftovers.
+  - name: issues_backfill
+    source: github
+    priority: best_effort
+    direction: backward
+    request:
+      path: /repos/{{ owner }}/{{ repo }}/issues
+      params:
+        state: all
+        per_page: 100
+        sort: updated
+        direction: desc
+    vars:
+      owner: rust-lang
+      repo: rust
+    pagination:
+      strategy: link_header
+      rel: next
+    records:
+      path: $
+      primary_key: $.id
+      cursor:
+        field: $.updated_at
+        type: rfc3339
