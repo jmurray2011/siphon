@@ -272,6 +272,46 @@ async fn a_query_language_stream_carries_its_mark_inside_the_query() {
 }
 
 #[tokio::test]
+async fn test_sends_the_same_request_a_real_sync_would() {
+    // The regression this guards: a probe that skipped the cursor sent
+    // `updated >= "{{ cursor }}"` verbatim. Jira accepts that and returns
+    // nothing, so `siphon test` reported a clean run against a query that
+    // would never have worked - the exact opposite of what the command is for.
+    let api = MockApi::spawn(|request| {
+        let query = request.param("query").unwrap_or_default();
+        if query.contains("{{") {
+            return Reply::json(r#"{"issues":[],"placeholder_leaked":true}"#);
+        }
+        Reply::json(
+            r#"{"issues":[{"key":"ABC-1","fields":{"updated":"2021-05-04T22:10:32.221+0100"}}]}"#,
+        )
+    })
+    .await;
+
+    let fixture = fixture(&api.base_url(), QUERY_LANGUAGE_STREAM);
+    let app = App::build(&fixture.config_path, Storage::Ephemeral)
+        .await
+        .expect("app builds");
+    let handle = app.stream("issues").expect("stream is configured");
+    let probe = app.worker.probe(&handle, 1).await.expect("probe runs");
+
+    assert_eq!(
+        probe.records.len(),
+        1,
+        "the probe should send the initial mark, not the placeholder"
+    );
+    let query = api.requests()[0]
+        .param("query")
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !query.contains("{{"),
+        "an unsubstituted placeholder reached the upstream: {query}"
+    );
+    assert!(query.contains("1970-01-01 00:00"), "got: {query}");
+}
+
+#[tokio::test]
 async fn a_basic_format_offset_still_advances_the_mark() {
     // The regression this guards: a `+0100` offset that fails to parse leaves
     // the high-water mark null, so every run re-walks the whole history while

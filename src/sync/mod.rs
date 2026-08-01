@@ -240,14 +240,7 @@ impl SyncWorker {
         let cursor_param_value = if options.full || !stream.is_incremental() {
             None
         } else {
-            let spec = stream.records.cursor();
-            let stored = checkpoint.cursor_val.as_deref().and_then(|raw| {
-                spec.map(|spec| {
-                    CursorValue::parse(raw, spec.kind())
-                        .map_or_else(|| raw.to_owned(), |value| value.render(spec))
-                })
-            });
-            stored.or_else(|| spec.and_then(|spec| spec.initial().map(str::to_owned)))
+            outgoing_cursor(stream, checkpoint.cursor_val.as_deref())
         };
         let mut high_water = stream
             .records
@@ -602,9 +595,15 @@ impl SyncWorker {
             error: None,
         };
 
+        // A probe that skipped the cursor would issue a request the real sync
+        // never makes - and for a `{{ cursor }}` stream it would send the
+        // placeholder verbatim, which is exactly the mistake `siphon test`
+        // exists to catch before it reaches the database.
+        let cursor = outgoing_cursor(stream, None);
+
         while report.pages < max_pages {
             let page_request = stream.paginator.request_for(&state);
-            let url = client.url_for(stream, &page_request, None)?;
+            let url = client.url_for(stream, &page_request, cursor.as_deref())?;
             report.urls.push(url.to_string());
 
             self.governor
@@ -668,6 +667,21 @@ enum Fetched {
         body_excerpt: String,
         detail: String,
     },
+}
+
+/// The mark to send upstream, rendered as the API wants it.
+///
+/// Falls back to the declared starting mark when nothing is stored yet, which
+/// is what makes the first request of a `{{ cursor }}` stream well-formed
+/// rather than carrying an unsubstituted placeholder.
+fn outgoing_cursor(stream: &Stream, stored: Option<&str>) -> Option<String> {
+    let spec = stream.records.cursor()?;
+    stored
+        .map(|raw| {
+            CursorValue::parse(raw, spec.kind())
+                .map_or_else(|| raw.to_owned(), |value| value.render(spec))
+        })
+        .or_else(|| spec.initial().map(str::to_owned))
 }
 
 /// A value in `[0, 1)` for full-jitter backoff.
