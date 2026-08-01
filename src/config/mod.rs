@@ -1,0 +1,869 @@
+//! The config format, which is the actual product; everything else is
+//! implementation.
+//!
+//! Loading is two steps. [`raw`] is what serde sees: the file's shape, with
+//! unknown keys refused. This module turns that into the validated types the
+//! rest of siphon uses, where a `Stream` cannot exist unless its JSONPaths
+//! compile, its pagination block is coherent, and its `{{ vars }}` are declared.
+//! A bad config never starts a run.
+//!
+//! The validated records are immutable: they are built only here and shared as
+//! [`Arc`], so their fields are readable but not reachable for mutation.
+
+pub mod duration;
+pub mod raw;
+pub mod secret;
+pub mod template;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::budget::{BudgetConfigError, BudgetPolicy};
+use crate::extract::{RecordSpec, RecordSpecError};
+use crate::governor::Priority;
+use crate::pagination::{PaginationConfigError, Paginator};
+
+use duration::format_duration;
+use raw::{ApiKeyLocation, Direction, RawAuth, RawConfig, RawRetry, WriteMode};
+use secret::SecretRef;
+
+/// The only config format version that exists.
+const SUPPORTED_VERSION: u32 = 1;
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(300);
+const DEFAULT_QUARANTINE_AFTER: u32 = 3;
+
+/// A validated config.
+#[derive(Debug)]
+pub struct Config {
+    /// Where the mirror is written.
+    pub store: StoreSpec,
+    /// APIs to pull from, by name.
+    pub sources: BTreeMap<String, Arc<Source>>,
+    /// Endpoints to mirror, in file order.
+    pub streams: Vec<Arc<Stream>>,
+}
+
+/// Where the mirror is written.
+#[derive(Debug, Clone)]
+pub struct StoreSpec {
+    /// Path to the SQLite file.
+    pub path: PathBuf,
+}
+
+/// One API, with everything needed to talk to it.
+#[derive(Debug)]
+pub struct Source {
+    /// The name it is referred to by.
+    pub name: String,
+    /// Scheme, host and any path prefix.
+    pub base_url: url::Url,
+    /// How to authenticate.
+    pub auth: Auth,
+    /// Headers sent with every request.
+    pub headers: BTreeMap<String, String>,
+    /// How the rate-limit budget is measured and spent.
+    pub budget: BudgetPolicy,
+    /// Whether to send conditional-request validators.
+    pub conditional_requests: bool,
+    /// Per-request timeout.
+    pub timeout: Duration,
+    /// Retry behaviour for transient failures.
+    pub retry: RetryPolicy,
+}
+
+/// How to authenticate to a source.
+///
+/// Secrets are held as references and resolved where they go onto the wire, so
+/// `siphon validate` can check a config on a machine that holds no credentials.
+#[derive(Debug, Clone)]
+pub enum Auth {
+    /// No credentials.
+    None,
+    /// `Authorization: Bearer <token>`.
+    Bearer(SecretRef),
+    /// HTTP basic auth.
+    Basic {
+        /// The user name.
+        username: SecretRef,
+        /// The password.
+        password: SecretRef,
+    },
+    /// A key in a header or query parameter.
+    ApiKey {
+        /// Name of the header or parameter.
+        name: String,
+        /// The key.
+        value: SecretRef,
+        /// Where to put it.
+        location: ApiKeyLocation,
+    },
+}
+
+impl Auth {
+    /// Every secret this auth method needs, for lint reporting.
+    fn secrets(&self) -> Vec<&SecretRef> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Bearer(token) => vec![token],
+            Self::Basic { username, password } => vec![username, password],
+            Self::ApiKey { value, .. } => vec![value],
+        }
+    }
+}
+
+/// Retry behaviour for transient failures.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Attempts a single request gets, including the first.
+    pub max_attempts: u32,
+    /// Backoff before the second attempt.
+    pub initial_backoff: Duration,
+    /// Ceiling the backoff doubles up to.
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Backoff before attempt number `attempt`, counting the first as 1.
+    ///
+    /// Exponential with full jitter: `rand_unit` is a value in `[0, 1)` supplied
+    /// by the caller, which keeps this deterministic under test while leaving
+    /// the randomness where it belongs - at the edge.
+    #[must_use]
+    pub fn backoff(&self, attempt: u32, rand_unit: f64) -> Duration {
+        let exponent = attempt.saturating_sub(1).min(16);
+        let ceiling = self
+            .initial_backoff
+            .saturating_mul(2u32.saturating_pow(exponent))
+            .min(self.max_backoff);
+        ceiling.mul_f64(rand_unit.clamp(0.0, 1.0))
+    }
+}
+
+/// One endpoint to mirror.
+#[derive(Debug)]
+pub struct Stream {
+    /// Unique name; also the key in the store.
+    pub name: String,
+    /// Which source this stream spends budget from.
+    pub source: String,
+    /// How stale this stream may get.
+    pub freshness: Option<Duration>,
+    /// What it is worth relative to the other streams.
+    pub priority: Priority,
+    /// Which way the walk runs.
+    pub direction: Direction,
+    /// The request to issue.
+    pub request: RequestSpec,
+    /// How to walk pages.
+    pub paginator: Paginator,
+    /// How to find records in the response.
+    pub records: RecordSpec,
+    /// Consecutive fatal failures on one page before it is quarantined.
+    pub quarantine_after: u32,
+}
+
+impl Stream {
+    /// True when this stream resumes from a stored high-water mark.
+    ///
+    /// A backward walk deliberately does not: it is working through history, so
+    /// the cursor of the newest record it has seen tells it nothing about where
+    /// its walk should resume.
+    #[must_use]
+    pub const fn is_incremental(&self) -> bool {
+        matches!(self.direction, Direction::Forward)
+    }
+}
+
+/// The request a stream issues, before pagination and cursor parameters.
+#[derive(Debug)]
+pub struct RequestSpec {
+    /// Path appended to the source's `base_url`, with `{{ vars }}` resolved.
+    pub path: String,
+    /// Query parameters, with `{{ vars }}` resolved.
+    pub params: BTreeMap<String, String>,
+    /// Headers for this stream only.
+    pub headers: BTreeMap<String, String>,
+}
+
+/// Why a config was rejected.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The file could not be read.
+    #[error("cannot read config `{path}`")]
+    Read {
+        /// The path that was tried.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The YAML did not parse, or did not match the schema.
+    #[error("cannot parse config: {0}")]
+    Parse(#[from] serde_yaml_ng::Error),
+    /// The `version` key named a format siphon does not know.
+    #[error("config version {found} is not supported; this build understands version {SUPPORTED_VERSION}")]
+    Version {
+        /// The version that was declared.
+        found: u32,
+    },
+    /// `base_url` was not a URL.
+    #[error("source `{source_name}` has an invalid base_url `{value}`: {cause}")]
+    BaseUrl {
+        /// The source that declared it.
+        source_name: String,
+        /// What was written.
+        value: String,
+        /// The parse failure.
+        cause: url::ParseError,
+    },
+    /// A source's budget block was invalid.
+    #[error("source `{source_name}`: {source}")]
+    Budget {
+        /// The source that declared it.
+        source_name: String,
+        /// The underlying failure.
+        #[source]
+        source: BudgetConfigError,
+    },
+    /// Two streams share a name.
+    #[error("stream `{0}` is declared more than once")]
+    DuplicateStream(String),
+    /// A stream referenced a source that does not exist.
+    #[error("stream `{stream}` refers to unknown source `{source_name}`")]
+    UnknownSource {
+        /// The stream that referred to it.
+        stream: String,
+        /// The name it used.
+        source_name: String,
+    },
+    /// A stream's pagination block was invalid.
+    #[error("stream `{stream}`: {source}")]
+    Pagination {
+        /// The stream that declared it.
+        stream: String,
+        /// The underlying failure.
+        #[source]
+        source: PaginationConfigError,
+    },
+    /// A stream's records block was invalid.
+    #[error("stream `{stream}`: {source}")]
+    Records {
+        /// The stream that declared it.
+        stream: String,
+        /// The underlying failure.
+        #[source]
+        source: RecordSpecError,
+    },
+    /// A `{{ var }}` was used without being declared.
+    #[error("stream `{stream}`: {source}")]
+    Template {
+        /// The stream that used it.
+        stream: String,
+        /// The underlying failure.
+        #[source]
+        source: template::TemplateError,
+    },
+    /// A stream with a deadline declared no freshness target, or the other way round.
+    #[error("stream `{stream}`: {message}")]
+    Freshness {
+        /// The stream in question.
+        stream: String,
+        /// What is wrong with it.
+        message: String,
+    },
+    /// A setting is reserved for a later version.
+    #[error("stream `{stream}`: {feature} is not implemented in v0.1")]
+    Unsupported {
+        /// The stream that asked for it.
+        stream: String,
+        /// The setting.
+        feature: String,
+    },
+}
+
+/// An advisory finding: the config loads and runs, but probably not as intended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lint {
+    /// What the finding is about, such as a source or stream name.
+    pub subject: String,
+    /// What the operator should know.
+    pub message: String,
+}
+
+impl Config {
+    /// Loads and validates a config file.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be read, does not parse, or does not validate.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_owned(),
+            source,
+        })?;
+        Self::parse(&text)
+    }
+
+    /// Validates a config that is already in memory.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the YAML does not parse or does not validate.
+    pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        let raw: RawConfig = serde_yaml_ng::from_str(text)?;
+        Self::validate(raw)
+    }
+
+    fn validate(raw: RawConfig) -> Result<Self, ConfigError> {
+        if raw.version != SUPPORTED_VERSION {
+            return Err(ConfigError::Version { found: raw.version });
+        }
+
+        let defaults = &raw.defaults;
+        let mut sources = BTreeMap::new();
+        for (name, source) in &raw.sources {
+            sources.insert(
+                name.clone(),
+                Arc::new(build_source(name, source, defaults)?),
+            );
+        }
+
+        let mut streams = Vec::with_capacity(raw.streams.len());
+        let mut seen = BTreeSet::new();
+        for stream in &raw.streams {
+            if !seen.insert(stream.name.clone()) {
+                return Err(ConfigError::DuplicateStream(stream.name.clone()));
+            }
+            if !sources.contains_key(&stream.source) {
+                return Err(ConfigError::UnknownSource {
+                    stream: stream.name.clone(),
+                    source_name: stream.source.clone(),
+                });
+            }
+            streams.push(Arc::new(build_stream(stream)?));
+        }
+
+        Ok(Self {
+            store: StoreSpec {
+                path: raw.store.path,
+            },
+            sources,
+            streams,
+        })
+    }
+
+    /// Finds a stream by name.
+    #[must_use]
+    pub fn stream(&self, name: &str) -> Option<&Arc<Stream>> {
+        self.streams.iter().find(|s| s.name == name)
+    }
+
+    /// The source a stream pulls from.
+    #[must_use]
+    pub fn source_for(&self, stream: &Stream) -> Option<&Arc<Source>> {
+        self.sources.get(&stream.source)
+    }
+
+    /// Advisory findings: things that load and run but are probably not intended.
+    ///
+    /// The unsatisfiable-freshness check is the one that matters. `freshness` is
+    /// a target, not a guarantee, and a tool that lets an operator declare
+    /// targets it can never meet - then reports the breach as if it were news -
+    /// is not an abstraction, it is a lie.
+    #[must_use]
+    pub fn lint(&self) -> Vec<Lint> {
+        let mut lints = Vec::new();
+
+        for (name, source) in &self.sources {
+            for secret in source.auth.secrets() {
+                if secret.is_inline() {
+                    lints.push(Lint {
+                        subject: format!("sources.{name}.auth"),
+                        message: "credential is written into the config file; use `${ENV_VAR}` or `file:/path` instead".to_owned(),
+                    });
+                }
+            }
+            lints.extend(self.freshness_feasibility(name, source));
+        }
+
+        for stream in &self.streams {
+            if stream.paginator.stops_on_seen_key() {
+                lints.push(Lint {
+                    subject: stream.name.clone(),
+                    message: "`stop_on_seen_key` stops the walk at the first record already stored; records updated in place without moving in sort order will be missed".to_owned(),
+                });
+            }
+        }
+
+        lints
+    }
+
+    /// Compares the requests the declared targets imply against the ceiling the
+    /// operator configured for the source.
+    fn freshness_feasibility(&self, name: &str, source: &Source) -> Option<Lint> {
+        let ceiling = source.budget.ceiling_per_hour()?;
+        let affordable = (ceiling as f64) * source.budget.utilization();
+
+        let required: f64 = self
+            .streams
+            .iter()
+            .filter(|s| s.source == *name)
+            .filter_map(|s| s.freshness)
+            .filter(|f| !f.is_zero())
+            .map(|f| 3_600.0 / f.as_secs_f64())
+            .sum();
+
+        (required > affordable).then(|| Lint {
+            subject: format!("sources.{name}"),
+            message: format!(
+                "declared freshness targets need at least {required:.0} requests/hour \
+                 but the configured ceiling allows {affordable:.0}; \
+                 targets will be missed in priority order"
+            ),
+        })
+    }
+}
+
+fn build_source(
+    name: &str,
+    raw: &raw::RawSource,
+    defaults: &raw::RawDefaults,
+) -> Result<Source, ConfigError> {
+    let base_url = url::Url::parse(&raw.base_url).map_err(|cause| ConfigError::BaseUrl {
+        source_name: name.to_owned(),
+        value: raw.base_url.clone(),
+        cause,
+    })?;
+
+    let budget =
+        BudgetPolicy::from_config(raw.budget.as_ref()).map_err(|source| ConfigError::Budget {
+            source_name: name.to_owned(),
+            source,
+        })?;
+
+    Ok(Source {
+        name: name.to_owned(),
+        base_url,
+        auth: build_auth(raw.auth.as_ref()),
+        headers: raw::scalars(&raw.headers),
+        budget,
+        conditional_requests: raw.conditional_requests.unwrap_or(true),
+        timeout: raw
+            .timeout
+            .or(defaults.timeout)
+            .map_or(DEFAULT_TIMEOUT, duration::HumanDuration::get),
+        retry: build_retry(raw.retry.as_ref().or(defaults.retry.as_ref())),
+    })
+}
+
+fn build_auth(raw: Option<&RawAuth>) -> Auth {
+    match raw {
+        None | Some(RawAuth::None) => Auth::None,
+        Some(RawAuth::Bearer { token }) => Auth::Bearer(token.clone()),
+        Some(RawAuth::Basic { username, password }) => Auth::Basic {
+            username: username.clone(),
+            password: password.clone(),
+        },
+        Some(RawAuth::ApiKey {
+            name,
+            value,
+            location,
+        }) => Auth::ApiKey {
+            name: name.clone(),
+            value: value.clone(),
+            location: *location,
+        },
+    }
+}
+
+fn build_retry(raw: Option<&RawRetry>) -> RetryPolicy {
+    let defaults = RetryPolicy::default();
+    let Some(raw) = raw else { return defaults };
+    RetryPolicy {
+        max_attempts: raw.max_attempts.unwrap_or(defaults.max_attempts).max(1),
+        initial_backoff: raw
+            .initial_backoff
+            .map_or(defaults.initial_backoff, duration::HumanDuration::get),
+        max_backoff: raw
+            .max_backoff
+            .map_or(defaults.max_backoff, duration::HumanDuration::get),
+    }
+}
+
+fn build_stream(raw: &raw::RawStream) -> Result<Stream, ConfigError> {
+    let name = raw.name.clone();
+
+    if raw.write.mode != WriteMode::Upsert {
+        return Err(ConfigError::Unsupported {
+            stream: name,
+            feature: format!("write mode `{}`", raw.write.mode.as_str()),
+        });
+    }
+    if raw.write.soft_delete {
+        return Err(ConfigError::Unsupported {
+            stream: name,
+            feature: "`soft_delete`".to_owned(),
+        });
+    }
+
+    let freshness = raw.freshness.map(duration::HumanDuration::get);
+    match (freshness, raw.priority) {
+        (Some(f), _) if f.is_zero() => {
+            return Err(ConfigError::Freshness {
+                stream: name,
+                message: "`freshness` must be greater than zero".to_owned(),
+            })
+        }
+        (Some(_), Priority::BestEffort) => {
+            return Err(ConfigError::Freshness {
+                stream: name,
+                message: "`best_effort` streams consume surplus budget only and cannot declare \
+                          `freshness`; drop one or the other"
+                    .to_owned(),
+            })
+        }
+        (None, Priority::BestEffort) => {}
+        (None, _) => {
+            return Err(ConfigError::Freshness {
+                stream: name,
+                message: "declare `freshness` (how stale this stream may get) or \
+                          `priority: best_effort` (run only on surplus budget)"
+                    .to_owned(),
+            })
+        }
+        (Some(_), _) => {}
+    }
+
+    let vars = raw::scalars(&raw.vars);
+    let render = |text: &str| {
+        template::render(text, &vars).map_err(|source| ConfigError::Template {
+            stream: raw.name.clone(),
+            source,
+        })
+    };
+
+    let request = RequestSpec {
+        path: render(&raw.request.path)?,
+        params: raw
+            .request
+            .params
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), render(v.as_str())?)))
+            .collect::<Result<_, ConfigError>>()?,
+        headers: raw::scalars(&raw.request.headers),
+    };
+
+    Ok(Stream {
+        name: raw.name.clone(),
+        source: raw.source.clone(),
+        freshness,
+        priority: raw.priority,
+        direction: raw.direction,
+        request,
+        paginator: Paginator::from_config(&raw.pagination).map_err(|source| {
+            ConfigError::Pagination {
+                stream: raw.name.clone(),
+                source,
+            }
+        })?,
+        records: RecordSpec::from_config(&raw.records).map_err(|source| ConfigError::Records {
+            stream: raw.name.clone(),
+            source,
+        })?,
+        quarantine_after: raw
+            .quarantine_after
+            .unwrap_or(DEFAULT_QUARANTINE_AFTER)
+            .max(1),
+    })
+}
+
+/// Renders a freshness target for display.
+#[must_use]
+pub fn freshness_label(freshness: Option<Duration>) -> String {
+    freshness.map_or_else(|| "-".to_owned(), format_duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"
+version: 1
+store:
+  type: sqlite
+  path: ./data/mirror.db
+sources:
+  github:
+    base_url: https://api.github.com
+    auth:
+      type: bearer
+      token: ${GITHUB_TOKEN}
+    headers:
+      Accept: application/vnd.github+json
+    budget:
+      requests_per_hour: 5000
+      observe:
+        remaining_header: X-RateLimit-Remaining
+        limit_header: X-RateLimit-Limit
+        reset_header: X-RateLimit-Reset
+        reset_format: unix_seconds
+      utilization: 0.8
+    conditional_requests: true
+streams:
+  - name: issues
+    source: github
+    freshness: 15m
+    priority: high
+    request:
+      path: /repos/{{ owner }}/{{ repo }}/issues
+      params:
+        state: all
+        per_page: 100
+        sort: updated
+        direction: asc
+    vars:
+      owner: rust-lang
+      repo: rust
+    pagination:
+      strategy: link_header
+      rel: next
+    records:
+      path: $
+      primary_key: $.id
+      cursor:
+        field: $.updated_at
+        type: rfc3339
+        param: since
+    write:
+      mode: upsert
+      soft_delete: false
+"#;
+
+    fn parse(text: &str) -> Config {
+        Config::parse(text).expect("config should be valid")
+    }
+
+    #[test]
+    fn parses_the_worked_example() {
+        let config = parse(MINIMAL);
+        assert_eq!(config.store.path, PathBuf::from("./data/mirror.db"));
+        assert_eq!(config.sources.len(), 1);
+        assert_eq!(config.streams.len(), 1);
+
+        let stream = config.stream("issues").expect("stream exists");
+        assert_eq!(stream.freshness, Some(Duration::from_secs(900)));
+        assert_eq!(stream.priority, Priority::High);
+        assert_eq!(stream.request.path, "/repos/rust-lang/rust/issues");
+        assert_eq!(stream.quarantine_after, DEFAULT_QUARANTINE_AFTER);
+
+        let source = config.source_for(stream).expect("source exists");
+        assert_eq!(source.timeout, DEFAULT_TIMEOUT);
+        assert!(source.conditional_requests);
+        assert!((source.budget.utilization() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn numeric_params_do_not_have_to_be_quoted() {
+        let config = parse(MINIMAL);
+        let stream = config.stream("issues").expect("stream exists");
+        assert_eq!(
+            stream.request.params.get("per_page").map(String::as_str),
+            Some("100")
+        );
+    }
+
+    #[test]
+    fn a_misspelled_key_is_refused() {
+        let text = MINIMAL.replace("freshness: 15m", "freshnes: 15m");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("freshnes"),
+            "error should name the bad key: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_version_is_refused() {
+        let text = MINIMAL.replace("version: 1", "version: 2");
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::Version { found: 2 }
+        ));
+    }
+
+    #[test]
+    fn an_unknown_source_reference_is_refused() {
+        let text = MINIMAL.replace("source: github", "source: gitlab");
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::UnknownSource { .. }
+        ));
+    }
+
+    #[test]
+    fn a_duplicate_stream_name_is_refused() {
+        let text = format!(
+            "{MINIMAL}{}",
+            &MINIMAL[MINIMAL.find("  - name: issues").unwrap_or(0)..]
+        );
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::DuplicateStream(_)
+        ));
+    }
+
+    #[test]
+    fn an_undeclared_template_var_is_refused() {
+        let text = MINIMAL.replace("{{ owner }}", "{{ ownr }}");
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::Template { .. }
+        ));
+    }
+
+    #[test]
+    fn a_bad_jsonpath_is_refused() {
+        let text = MINIMAL.replace("primary_key: $.id", "primary_key: \"$[\"");
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::Records { .. }
+        ));
+    }
+
+    #[test]
+    fn an_out_of_range_utilization_is_refused() {
+        let text = MINIMAL.replace("utilization: 0.8", "utilization: 1.8");
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::Budget { .. }
+        ));
+    }
+
+    #[test]
+    fn a_stream_with_no_freshness_and_no_best_effort_is_refused() {
+        let text = MINIMAL.replace("    freshness: 15m\n", "");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Freshness { .. }),
+            "expected a freshness error, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_best_effort_stream_with_freshness_is_refused() {
+        let text = MINIMAL.replace("priority: high", "priority: best_effort");
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::Freshness { .. }
+        ));
+    }
+
+    #[test]
+    fn a_best_effort_backfill_needs_no_freshness() {
+        let text = MINIMAL
+            .replace("    freshness: 15m\n", "")
+            .replace("priority: high", "priority: best_effort");
+        let config = parse(&text);
+        let stream = config.stream("issues").expect("stream exists");
+        assert_eq!(stream.priority, Priority::BestEffort);
+        assert_eq!(stream.freshness, None);
+    }
+
+    #[test]
+    fn a_reserved_write_mode_says_so_rather_than_silently_upserting() {
+        let text = MINIMAL.replace("mode: upsert", "mode: replace");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Unsupported { .. }),
+            "expected an unsupported error, got {err}"
+        );
+    }
+
+    #[test]
+    fn an_inline_credential_is_linted() {
+        let text = MINIMAL.replace("${GITHUB_TOKEN}", "ghp_hardcoded");
+        let lints = parse(&text).lint();
+        assert!(
+            lints
+                .iter()
+                .any(|l| l.message.contains("written into the config")),
+            "expected an inline-secret lint, got {lints:?}"
+        );
+    }
+
+    #[test]
+    fn an_env_credential_is_not_linted() {
+        assert!(parse(MINIMAL).lint().is_empty());
+    }
+
+    #[test]
+    fn unsatisfiable_freshness_targets_are_linted() {
+        // The ceiling affords 5000 x 0.8 = 4000 requests/hour. A 500ms target
+        // needs 7200 even if every sync were a single request.
+        let text = MINIMAL.replace("freshness: 15m", "freshness: 500ms");
+        let lints = parse(&text).lint();
+        assert!(
+            lints.iter().any(|l| l.message.contains("requests/hour")),
+            "expected a feasibility lint, got {lints:?}"
+        );
+    }
+
+    #[test]
+    fn satisfiable_freshness_targets_are_not_linted() {
+        let lints = parse(MINIMAL).lint();
+        assert!(!lints.iter().any(|l| l.message.contains("requests/hour")));
+    }
+
+    #[test]
+    fn stop_on_seen_key_carries_a_warning() {
+        let text = MINIMAL.replace(
+            "      strategy: link_header\n      rel: next",
+            "      strategy: link_header\n      rel: next\n      stop_on_seen_key: true",
+        );
+        let lints = parse(&text).lint();
+        assert!(
+            lints.iter().any(|l| l.message.contains("stop_on_seen_key")),
+            "expected a stop_on_seen_key lint, got {lints:?}"
+        );
+    }
+
+    #[test]
+    fn backoff_is_exponential_capped_and_jittered() {
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(8),
+        };
+        // Full jitter: the value is somewhere in [0, ceiling].
+        assert_eq!(policy.backoff(1, 1.0), Duration::from_secs(1));
+        assert_eq!(policy.backoff(2, 1.0), Duration::from_secs(2));
+        assert_eq!(policy.backoff(3, 1.0), Duration::from_secs(4));
+        assert_eq!(policy.backoff(4, 1.0), Duration::from_secs(8));
+        assert_eq!(policy.backoff(9, 1.0), Duration::from_secs(8));
+        assert_eq!(policy.backoff(3, 0.0), Duration::ZERO);
+        assert_eq!(policy.backoff(3, 0.5), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn missing_file_reports_the_path() {
+        let err = Config::load("/nonexistent/siphon.yaml").unwrap_err();
+        assert!(matches!(err, ConfigError::Read { .. }));
+    }
+}

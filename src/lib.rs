@@ -12,6 +12,7 @@
 
 pub mod budget;
 pub mod clock;
+pub mod config;
 pub mod extract;
 pub mod governor;
 pub mod pagination;
