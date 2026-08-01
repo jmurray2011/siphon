@@ -234,11 +234,20 @@ impl SyncWorker {
             .unwrap_or_else(|| stream.paginator.initial());
 
         // The incremental cursor is fixed for the whole walk: it is the mark the
-        // *previous* walk finished on, and it is what makes this walk cheap.
+        // *previous* walk finished on, and it is what makes this walk cheap. It
+        // is rendered in whatever shape the upstream accepts, which is often
+        // narrower than the shape it emits.
         let cursor_param_value = if options.full || !stream.is_incremental() {
             None
         } else {
-            checkpoint.cursor_val.clone()
+            let spec = stream.records.cursor();
+            let stored = checkpoint.cursor_val.as_deref().and_then(|raw| {
+                spec.map(|spec| {
+                    CursorValue::parse(raw, spec.kind())
+                        .map_or_else(|| raw.to_owned(), |value| value.render(spec))
+                })
+            });
+            stored.or_else(|| spec.and_then(|spec| spec.initial().map(str::to_owned)))
         };
         let mut high_water = stream
             .records

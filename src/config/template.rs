@@ -23,12 +23,34 @@ pub enum TemplateError {
     },
 }
 
+/// The built-in placeholder that carries the incremental high-water mark.
+///
+/// Reserved rather than user-declarable: it is resolved per request, not at
+/// load, because its value is whatever the last run finished on.
+pub const CURSOR: &str = "cursor";
+
 /// Substitutes `{{ name }}` placeholders from `vars`.
 ///
 /// # Errors
 ///
 /// Fails on an undeclared variable or an unclosed placeholder.
 pub fn render(template: &str, vars: &BTreeMap<String, String>) -> Result<String, TemplateError> {
+    render_deferring(template, vars, &[])
+}
+
+/// Substitutes `{{ name }}` placeholders, leaving `deferred` ones intact.
+///
+/// This is what lets `{{ cursor }}` survive config load and be resolved per
+/// request, while a misspelled `{{ ownr }}` is still a startup error.
+///
+/// # Errors
+///
+/// Fails on an undeclared, non-deferred variable or an unclosed placeholder.
+pub fn render_deferring(
+    template: &str,
+    vars: &BTreeMap<String, String>,
+    deferred: &[&str],
+) -> Result<String, TemplateError> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
 
@@ -39,10 +61,19 @@ pub fn render(template: &str, vars: &BTreeMap<String, String>) -> Result<String,
             template: template.to_owned(),
         })?;
         let name = after[..close].trim();
-        let value = vars.get(name).ok_or_else(|| TemplateError::UnknownVar {
-            name: name.to_owned(),
-        })?;
-        out.push_str(value);
+
+        if deferred.contains(&name) {
+            // Re-emitted in a normalised spelling so the later pass only has
+            // one form to match.
+            out.push_str("{{ ");
+            out.push_str(name);
+            out.push_str(" }}");
+        } else {
+            let value = vars.get(name).ok_or_else(|| TemplateError::UnknownVar {
+                name: name.to_owned(),
+            })?;
+            out.push_str(value);
+        }
         rest = &after[close + 2..];
     }
     out.push_str(rest);
@@ -109,6 +140,40 @@ mod tests {
     fn unclosed_placeholder_is_an_error() {
         let err = render("/x/{{ oops", &vars(&[])).unwrap_err();
         assert!(matches!(err, TemplateError::Unclosed { .. }));
+    }
+
+    #[test]
+    fn a_deferred_placeholder_survives_the_first_pass() {
+        let v = vars(&[("project", "ABC")]);
+        let rendered = render_deferring(
+            "project = {{ project }} AND updated >= \"{{ cursor }}\"",
+            &v,
+            &[CURSOR],
+        )
+        .unwrap();
+        assert_eq!(rendered, "project = ABC AND updated >= \"{{ cursor }}\"");
+
+        // The second pass resolves what the first one left.
+        let resolved = render(&rendered, &vars(&[("cursor", "2021-05-04 22:10")])).unwrap();
+        assert_eq!(resolved, "project = ABC AND updated >= \"2021-05-04 22:10\"");
+    }
+
+    #[test]
+    fn deferring_normalises_the_spelling() {
+        let rendered =
+            render_deferring("a={{cursor}} b={{  cursor  }}", &vars(&[]), &[CURSOR]).unwrap();
+        assert_eq!(rendered, "a={{ cursor }} b={{ cursor }}");
+    }
+
+    #[test]
+    fn deferring_still_catches_a_misspelled_var() {
+        let err = render_deferring("{{ ownr }}", &vars(&[]), &[CURSOR]).unwrap_err();
+        assert_eq!(
+            err,
+            TemplateError::UnknownVar {
+                name: "ownr".to_owned()
+            }
+        );
     }
 
     #[test]

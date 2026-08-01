@@ -256,20 +256,38 @@ impl SourceClient {
         }
 
         {
+            let interpolate: BTreeMap<String, String> = cursor
+                .map(|value| {
+                    [(crate::config::template::CURSOR.to_owned(), value.to_owned())].into()
+                })
+                .unwrap_or_default();
+
             let mut query = url.query_pairs_mut();
             for (name, value) in &stream.request.params {
-                query.append_pair(name, value);
+                // A parameter carrying `{{ cursor }}` gets the mark spliced in.
+                // Everything else was fully resolved at config load.
+                let resolved = if stream.request.interpolates_cursor() && !interpolate.is_empty() {
+                    crate::config::template::render(value, &interpolate)
+                        .unwrap_or_else(|_| value.clone())
+                } else {
+                    value.clone()
+                };
+                query.append_pair(name, &resolved);
             }
             for (name, value) in &page.params {
                 query.append_pair(name, value);
             }
-            if let Some(value) = cursor {
-                if let Some(param) = stream
-                    .records
-                    .cursor()
-                    .and_then(super::extract::CursorSpec::param)
-                {
-                    query.append_pair(param, value);
+            // The mark goes in one place or the other, never both; the config
+            // layer refuses a stream that declares both spellings.
+            if !stream.request.interpolates_cursor() {
+                if let Some(value) = cursor {
+                    if let Some(param) = stream
+                        .records
+                        .cursor()
+                        .and_then(super::extract::CursorSpec::param)
+                    {
+                        query.append_pair(param, value);
+                    }
                 }
             }
         }

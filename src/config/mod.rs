@@ -196,9 +196,26 @@ pub struct RequestSpec {
     /// Path appended to the source's `base_url`, with `{{ vars }}` resolved.
     pub path: String,
     /// Query parameters, with `{{ vars }}` resolved.
+    ///
+    /// A `{{ cursor }}` placeholder is deliberately *not* resolved here: it
+    /// carries the high-water mark, which is only known per run.
     pub params: BTreeMap<String, String>,
     /// Headers for this stream only.
     pub headers: BTreeMap<String, String>,
+    /// Whether any parameter interpolates the cursor.
+    interpolates_cursor: bool,
+}
+
+impl RequestSpec {
+    /// True when the high-water mark belongs inside a parameter rather than
+    /// appended as one of its own.
+    ///
+    /// This is what an API with a query language needs: the mark is one clause
+    /// of a JQL, SOQL or OData expression, not a parameter beside it.
+    #[must_use]
+    pub const fn interpolates_cursor(&self) -> bool {
+        self.interpolates_cursor
+    }
 }
 
 /// Why a config was rejected.
@@ -282,6 +299,14 @@ pub enum ConfigError {
     /// A stream with a deadline declared no freshness target, or the other way round.
     #[error("stream `{stream}`: {message}")]
     Freshness {
+        /// The stream in question.
+        stream: String,
+        /// What is wrong with it.
+        message: String,
+    },
+    /// The cursor declaration and the request contradict each other.
+    #[error("stream `{stream}`: {message}")]
+    Cursor {
         /// The stream in question.
         stream: String,
         /// What is wrong with it.
@@ -552,23 +577,63 @@ fn build_stream(raw: &raw::RawStream) -> Result<Stream, ConfigError> {
     }
 
     let vars = raw::scalars(&raw.vars);
-    let render = |text: &str| {
-        template::render(text, &vars).map_err(|source| ConfigError::Template {
+    let render = |text: &str, defer: bool| {
+        let deferred: &[&str] = if defer { &[template::CURSOR] } else { &[] };
+        template::render_deferring(text, &vars, deferred).map_err(|source| ConfigError::Template {
             stream: raw.name.clone(),
             source,
         })
     };
 
+    let params: BTreeMap<String, String> = raw
+        .request
+        .params
+        .iter()
+        .map(|(k, v)| Ok((k.clone(), render(v.as_str(), true)?)))
+        .collect::<Result<_, ConfigError>>()?;
+    let interpolates_cursor = params.values().any(|v| v.contains("{{ cursor }}"));
+
     let request = RequestSpec {
-        path: render(&raw.request.path)?,
-        params: raw
-            .request
-            .params
-            .iter()
-            .map(|(k, v)| Ok((k.clone(), render(v.as_str())?)))
-            .collect::<Result<_, ConfigError>>()?,
+        path: render(&raw.request.path, false)?,
+        params,
         headers: raw::scalars(&raw.request.headers),
+        interpolates_cursor,
     };
+
+    let records = RecordSpec::from_config(&raw.records).map_err(|source| ConfigError::Records {
+        stream: raw.name.clone(),
+        source,
+    })?;
+
+    // A `{{ cursor }}` with nothing to fill it is a stream that would send the
+    // placeholder verbatim to the upstream, which no API will do anything
+    // sensible with.
+    if interpolates_cursor {
+        let Some(cursor) = records.cursor() else {
+            return Err(ConfigError::Cursor {
+                stream: raw.name.clone(),
+                message: "`{{ cursor }}` is used in `request.params` but no `records.cursor` \
+                          block declares where the mark comes from"
+                    .to_owned(),
+            });
+        };
+        if cursor.initial().is_none() {
+            return Err(ConfigError::Cursor {
+                stream: raw.name.clone(),
+                message: "`{{ cursor }}` needs `records.cursor.initial`: the first run has no \
+                          stored mark, and there is nothing sensible to substitute"
+                    .to_owned(),
+            });
+        }
+        if cursor.param().is_some() {
+            return Err(ConfigError::Cursor {
+                stream: raw.name.clone(),
+                message: "`records.cursor.param` appends the mark as its own parameter and \
+                          `{{ cursor }}` interpolates it into one; declare only one"
+                    .to_owned(),
+            });
+        }
+    }
 
     Ok(Stream {
         name: raw.name.clone(),
@@ -583,10 +648,7 @@ fn build_stream(raw: &raw::RawStream) -> Result<Stream, ConfigError> {
                 source,
             }
         })?,
-        records: RecordSpec::from_config(&raw.records).map_err(|source| ConfigError::Records {
-            stream: raw.name.clone(),
-            source,
-        })?,
+        records,
         quarantine_after: raw
             .quarantine_after
             .unwrap_or(DEFAULT_QUARANTINE_AFTER)
@@ -784,6 +846,97 @@ streams:
         let stream = config.stream("issues").expect("stream exists");
         assert_eq!(stream.priority, Priority::BestEffort);
         assert_eq!(stream.freshness, None);
+    }
+
+    /// A stream shaped like an API with a query language, where the mark is one
+    /// clause of an expression rather than a parameter of its own.
+    const QUERY_LANGUAGE: &str = r#"
+version: 1
+store:
+  type: sqlite
+  path: ./x.db
+sources:
+  api:
+    base_url: https://api.example.com
+streams:
+  - name: issues
+    source: api
+    freshness: 15m
+    request:
+      path: /search
+      params:
+        query: 'project = {{ project }} AND updated >= "{{ cursor }}" ORDER BY updated ASC'
+    vars:
+      project: ABC
+    pagination:
+      strategy: cursor
+      cursor_param: nextPageToken
+      cursor_path: $.nextPageToken
+    records:
+      path: $.issues
+      primary_key: $.key
+      cursor:
+        field: $.fields.updated
+        type: rfc3339
+        format: "%Y-%m-%d %H:%M"
+        initial: "1970-01-01 00:00"
+"#;
+
+    #[test]
+    fn a_cursor_placeholder_survives_config_load() {
+        let config = parse(QUERY_LANGUAGE);
+        let stream = config.stream("issues").expect("stream exists");
+        assert!(stream.request.interpolates_cursor());
+        // Declared vars are resolved; the cursor deliberately is not.
+        assert_eq!(
+            stream.request.params.get("query").map(String::as_str),
+            Some(r#"project = ABC AND updated >= "{{ cursor }}" ORDER BY updated ASC"#)
+        );
+    }
+
+    #[test]
+    fn a_cursor_placeholder_without_a_cursor_block_is_refused() {
+        let text = QUERY_LANGUAGE
+            .replace("      cursor:\n", "      unused:\n")
+            .replace("        field: $.fields.updated\n", "")
+            .replace("        type: rfc3339\n", "")
+            .replace("        format: \"%Y-%m-%d %H:%M\"\n", "")
+            .replace("        initial: \"1970-01-01 00:00\"\n", "");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("records.cursor") || matches!(err, ConfigError::Parse(_)),
+            "expected a cursor error, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_cursor_placeholder_without_an_initial_mark_is_refused() {
+        let text = QUERY_LANGUAGE.replace("        initial: \"1970-01-01 00:00\"\n", "");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Cursor { .. }) && format!("{err}").contains("initial"),
+            "expected an initial-mark error, got {err}"
+        );
+    }
+
+    #[test]
+    fn declaring_both_ways_of_sending_the_mark_is_refused() {
+        let text = QUERY_LANGUAGE.replace(
+            "        initial: \"1970-01-01 00:00\"",
+            "        initial: \"1970-01-01 00:00\"\n        param: since",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Cursor { .. }),
+            "expected a cursor conflict, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_stream_without_a_placeholder_does_not_claim_to_interpolate() {
+        let config = parse(MINIMAL);
+        let stream = config.stream("issues").expect("stream exists");
+        assert!(!stream.request.interpolates_cursor());
     }
 
     #[test]
