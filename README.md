@@ -162,8 +162,11 @@ github              4211/5000      41m12s         1.36       2s  ok
 
 ## Configuration
 
-The config format is the product; everything else is implementation. See
-[`examples/github.yaml`](examples/github.yaml) for a fully commented file.
+The config format is the product; everything else is implementation. Two fully
+commented files: [`examples/github.yaml`](examples/github.yaml), and
+[`examples/bitbucket.yaml`](examples/bitbucket.yaml), which runs with no
+credentials and covers the awkward cases - a rate-limit counter that cannot be
+read verbatim, and an incremental mark that lives inside a query expression.
 
 ### Sources
 

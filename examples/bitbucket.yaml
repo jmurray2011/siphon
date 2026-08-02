@@ -1,0 +1,130 @@
+# A worked example: mirror a Bitbucket workspace into SQLite.
+#
+#   siphon validate examples/bitbucket.yaml
+#   siphon test pull_requests --config examples/bitbucket.yaml
+#   siphon run examples/bitbucket.yaml
+#
+# It runs as written, with no credentials: these are public endpoints and
+# Bitbucket answers them anonymously at 60 requests/hour. Swap the `auth` block
+# below for an app password to raise that.
+#
+# This example exists because Bitbucket exercises two things the GitHub one
+# cannot - a rate-limit counter that cannot be trusted verbatim, and an
+# incremental mark that lives inside a query expression.
+
+version: 1
+
+store:
+  type: sqlite
+  path: ./data/bitbucket.db
+
+defaults:
+  timeout: 30s
+  retry:
+    max_attempts: 5
+    initial_backoff: 1s
+    max_backoff: 5m
+
+sources:
+  bitbucket:
+    base_url: https://api.bitbucket.org/2.0
+    # Anonymous. For an app password, replace this with:
+    #
+    #   auth:
+    #     type: basic
+    #     username: ${BITBUCKET_USERNAME}
+    #     password: ${BITBUCKET_APP_PASSWORD}
+    #
+    # A `${ENV}` reference that is not set is a hard error at run time, not a
+    # silent fallback to anonymous, so the two cases stay distinguishable.
+    auth:
+      type: none
+    budget:
+      # The anonymous ceiling, used only until the API says otherwise - which it
+      # does on every response, so a credential raises this without config.
+      requests_per_hour: 60
+      # No `observe:` block. Bitbucket sends `X-RateLimit-*`, so the fields are
+      # detected. Two of its three values are unlike GitHub's and are read
+      # correctly anyway:
+      #
+      #   x-ratelimit-limit: 60, 60;w=3600   the quota, then the policy that set
+      #                                      it; the leading integer is the one
+      #                                      to pace against
+      #   x-ratelimit-reset: 3506            seconds until reset, not a unix
+      #                                      instant, and aligned to the hour
+      #
+      # The third is why siphon never trusts a rising count within a window:
+      # `x-ratelimit-remaining` is served by several nodes whose tallies
+      # disagree and move in both directions. See the survey in the README.
+      utilization: 0.8
+    # Bitbucket sends an `ETag` on these endpoints, so unchanged pages cost a
+    # 304 rather than a full body.
+    conditional_requests: true
+
+streams:
+  # The workspace catalogue. Small and slow-moving, so it is walked whole.
+  - name: repositories
+    source: bitbucket
+    freshness: 6h
+    priority: normal
+    request:
+      path: /repositories/{{ workspace }}
+      params:
+        sort: -updated_on
+    vars:
+      workspace: atlassian
+    # Bitbucket's own pagination is a full URL in `next`, which is
+    # `strategy: next_url` and not implemented in v0.1. It also accepts
+    # `page` and `pagelen`, which is what this uses instead. Note that
+    # `pagelen` appears only here and not in `request.params` above: naming it
+    # twice sends it twice, and `validate` lints exactly that.
+    pagination:
+      strategy: page
+      page_param: page
+      size_param: pagelen
+      page_size: 50
+    records:
+      path: $.values
+      primary_key: $.uuid
+    write:
+      mode: upsert
+
+  # Pull requests, incremental. Bitbucket has no `since` parameter; the mark is
+  # one clause of a BBQL expression, so it is interpolated with `{{ cursor }}`
+  # rather than declared as `cursor.param`.
+  - name: pull_requests
+    source: bitbucket
+    freshness: 15m
+    priority: high
+    request:
+      path: /repositories/{{ workspace }}/{{ repo }}/pullrequests
+      params:
+        # Supplying `q` also replaces the default filter, which would otherwise
+        # return open pull requests only.
+        q: 'updated_on > "{{ cursor }}"'
+        sort: updated_on
+    vars:
+      workspace: atlassian
+      repo: forge-presentations
+    pagination:
+      strategy: page
+      page_param: page
+      size_param: pagelen
+      page_size: 50
+    records:
+      path: $.values
+      primary_key: $.id
+      cursor:
+        field: $.updated_on
+        type: rfc3339
+        # `initial` is required whenever `{{ cursor }}` is used: the first run
+        # has no stored mark and there is nothing sensible to substitute.
+        initial: "1970-01-01T00:00:00+00:00"
+        # Deliberately no `format`. Bitbucket accepts the microsecond timestamp
+        # it emits and compares it exactly, so the mark round-trips as-is.
+        # Narrowing it here would be actively wrong: truncating
+        # 2025-07-31T05:54:13.349627+00:00 to the second re-matches the record
+        # at that instant on every run. That is the opposite of the Jira case,
+        # where narrowing is mandatory - which is why `format` is opt-in.
+    write:
+      mode: upsert
