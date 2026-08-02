@@ -2,9 +2,9 @@
 
 > Working name. A single-binary, config-driven daemon that mirrors arbitrary HTTP APIs into a local database, scheduling its own polling against a measured rate-limit budget.
 
-**Status:** design draft
+**Status:** v0.1 built; see §15 for what is next and why the order changed
 **Language:** Rust
-**Primary store:** SQLite (Postgres as a second target later)
+**Primary store:** SQLite and Postgres, both first-class. See §9 and open question 9, now decided.
 
 ---
 
@@ -23,7 +23,13 @@ There is also a fifth problem that no existing tool treats as a problem at all:
 
 5. **Deciding what to spend a finite request budget on.** Every tool models the rate limit as a constraint to avoid violating — a static token bucket, plus retry-on-429. None of them treat the remaining budget as a resource to allocate across competing streams. The consequence is a well-documented failure mode: under pressure, a cron-driven pipeline spends its budget uniformly, hits the wall, backs off, hits it again, and falls hours behind on the data that mattered while faithfully refreshing the data that didn't.
 
-siphon's thesis is that (5) is the actual differentiator, and that (1)–(4) are table stakes it has to get right in order to earn the right to solve it.
+And a sixth, which only shows up once you have written (1)-(4) more than twice:
+
+6. **Every project that needs the same upstream keeps its own copy of it.** Not just its own fetch loop - its own store, its own schema, its own watermark, and its own share of the same rate-limit budget. Ten projects pulling from four APIs is forty implementations and ten databases, and the copies drift, because nothing makes them agree on what "new" means. The duplication that hurts is not the storage, which is cheap. It is that the same tickets are fetched twice by two fetchers that disagree.
+
+siphon's thesis is that (5) is the actual differentiator, and that (1)-(4) are table stakes it has to get right in order to earn the right to solve it. (6) is what makes it worth running as shared infrastructure rather than as a library each project vendors: one mirror per upstream, read by many consumers, paced once against one budget.
+
+That last part is a claim about *who reads the store*, and it is load-bearing. A mirror with one owner can put its store anywhere. A mirror with many consumers cannot - which is what forces the storage decision in §9 rather than leaving it to taste.
 
 ---
 
@@ -36,10 +42,11 @@ siphon's thesis is that (5) is the actual differentiator, and that (1)–(4) are
 - **G4.** Survive upstream schema drift without operator intervention or data loss.
 - **G5.** Ship as one binary with no runtime dependency. `siphon run config.yaml` and nothing else.
 - **G6.** Make the config cheap to author, since there is no connector catalog to fall back on. Going from a bare URL to a working stream should take under a minute.
+- **G7.** Be readable by consumers siphon does not know about, without siphon serving anything. One upstream is mirrored once and read by many projects, each of which keeps its *derived* data - search indexes, embeddings, classifications, resolved names - in its own store, joined to the mirror by upstream ID. The line is: siphon owns what was fetched, the consumer owns what was computed. A consumer that has to re-fetch to compute is a failure of this goal; a consumer that has to re-compute is not.
 
 ## 3. Non-goals
 
-- **NG1. Serving a read API.** Explicitly cut. The output is a SQLite file (or Postgres schema); point Datasette, PostgREST, or your own app at it. Building a bespoke read layer is the single fastest way to turn this from a small tool into an unfinishable product.
+- **NG1. Serving a read API.** Explicitly cut. The output is a SQLite file (or Postgres schema); point Datasette, PostgREST, or your own app at it. Building a bespoke read layer is the single fastest way to turn this from a small tool into an unfinishable product. G7 does not reverse this, it depends on it: the way many consumers read one mirror is a database wire protocol that every language already speaks, not an HTTP surface siphon has to design, version, authenticate and keep up. "We will have to serve it" is true, and Postgres is the answer to it.
 - **NG2. Writing back to the source API.** Read-only mirror. Bidirectional sync is a different, much harder product.
 - **NG3. Transformations.** No DSL, no expression language beyond field extraction. Transform in SQL downstream.
 - **NG4. A connector catalog.** No pre-built Stripe/Salesforce/HubSpot connectors. Maintaining those is a full-time treadmill and is the business that other people are already in. Users write ~30 lines of YAML per endpoint.
@@ -61,6 +68,8 @@ Closest neighbours and why they don't cover this:
 | Steampipe | Go | Zero-ETL — queries live, never persists |
 
 All six share the same blind spot: the rate limit is a static ceiling configured by the operator, and scheduling is a cron expression that ignores it. None of them can answer "I have 800 requests left this hour and four streams that want them — which do I serve?"
+
+Under G7 one of those rows stops being a competitor. Steampipe is listed above for what it lacks - it queries live and never persists - but that is the exact complement of what siphon is: a durable, incrementally maintained, budget-paced store with no query surface of its own. Steampipe over a siphon-maintained Postgres is a better answer than either half, and it is a reason *not* to build the query layer here. The same goes for Datasette, PostgREST and anything else that speaks to a database. siphon's job is to make the store worth pointing them at.
 
 ---
 
@@ -347,6 +356,15 @@ Implementation is a SQL query over `_siphon_runs` plus a print function. Roughly
 
 ## 9. Storage model
 
+**Target choice follows from who reads it.** A single-owner mirror is happiest as a SQLite file: no server, no ceremony, and `sqlite3` on the same box. The moment more than one project reads it, or the daemon runs on a different host from a consumer, that file stops working - not because SQLite is weak, but because a file is reachable from exactly one filesystem and tolerates exactly one writer. Both are true of the setup this is actually for.
+
+So both targets are first-class, and they are for different deployments rather than different maturity levels:
+
+- **SQLite** for a single-owner mirror on the same box as its reader, and for `siphon test`, examples, and anything self-contained.
+- **Postgres** for a shared cache: several consumers, possibly several hosts, each holding its own derived tables next to the cached ones and joining locally.
+
+This is what makes G7 work without an HTTP API, and it is why the storage layer is a trait rather than a struct over `rusqlite`. Deciding it late is how the trait gets designed wrong - it would have been shaped entirely by what a single embedded connection happens to make easy, and then bent afterwards around transactions, connection pooling and concurrent writers, all of which SQLite lets you ignore and Postgres does not.
+
 Two-layer: an append-only raw layer, and a typed projection.
 
 ```sql
@@ -543,16 +561,23 @@ Config parse/validate; `offset` + `page` + `cursor` + `link_header` pagination; 
 
 Quarantine and skew correction are in v0.1 rather than deferred because both are governor-specific failure modes, not general robustness polish. A scheduler that preferentially funds a stream stuck on a poison page, or that paces against a clock it shouldn't trust, doesn't fail gracefully — it fails in exactly the direction the whole design was meant to prevent.
 
-**v0.2 — usability**
-`siphon infer`; `status --advise` change-rate advisory; `next_url` strategy; typed projection with drift handling; `schema` / `reproject` / `budget` / `quarantine` commands; full retry classification; dead-letter table.
+**v0.2 — the shared cache**
+Storage trait; Postgres target; typed projection with drift handling. These three are one piece of work and they come first, ahead of everything previously scheduled here, because they are what G7 needs and because every later feature writes through the storage layer. Adding coverage first means adding it into a store that cannot be shared, and then porting all of it.
+
+The reorder has a cost worth stating: it puts a second store target in front of `siphon infer` and the change-rate advisory, which are the features that make the tool pleasant for a single user. That is the right trade only while the shared-cache case is real. If it stops being real, this ordering should go back.
+
+**v0.2a — usability**
+`siphon infer`; `status --advise` change-rate advisory; `next_url` strategy; `schema` / `reproject` / `budget` / `quarantine` commands; full retry classification; dead-letter table.
 
 **v0.3 — breadth**
-Parent-child streams (deficit inherits from parent), OAuth2 client credentials, Postgres store target, Prometheus metrics, `rhai` escape hatch.
+Parent-child streams (deficit inherits from parent), OAuth2 client credentials, Prometheus metrics, `rhai` escape hatch. The Postgres store target used to be listed here and moved up to v0.2; see open question 9.
 
 **v0.4 — polish**
 GraphQL support (`request.graphql` with query + variables, `pagination.strategy: relay_cursor` for `pageInfo.endCursor` / `hasNextPage`), full-refresh mode, Docker image, docs site.
 
 Ship v0.1 before writing a line of v0.2. The temptation will be to build the config format for all four milestones up front; resist it beyond reserving key names.
+
+That instruction no longer applies as written. Shipping v0.1 to anyone else is not a goal; the consumers are local and known. What survives from it is narrower and still true: the storage trait is being extracted against a codebase exactly one machine has ever run, so the SQLite implementation is the only evidence the trait is shaped right. Weight its conformance tests accordingly.
 
 ### Riskiest assumption to test first
 
@@ -601,7 +626,7 @@ Recorded so they don't get re-litigated every few months.
 6. **Typed projection: eager or lazy?** Eager is simpler; lazy ingests faster. Possibly `store.project: eager | lazy | off`.
 7. **How much does the raw layer actually cost?** Benchmark on a 10M-record stream before committing to it as the default.
 8. **One YAML file or a `config.d/` directory?** The latter scales past ~10 streams. Probably support both.
-9. **Postgres first-class or afterthought?** SQLite-first is the differentiated story; Postgres is what people ask for on day one. Deciding late means the storage trait gets designed wrong.
+9. ~~**Postgres first-class or afterthought?**~~ **Decided: first-class, and it moved to the front of v0.2.** The forcing argument was not "people ask for it" - it was G7. A shared cache read by several projects on more than one host cannot be a file, and the alternative to a database wire protocol is siphon growing the read API that NG1 exists to prevent. The warning in the original question was right and nearly came true: v0.1 shipped with `Store` as a concrete struct over `rusqlite`, so the trait now has to be extracted rather than designed, with the SQLite implementation as the thing to check it against rather than the thing that defines it.
 10. **What's the right behaviour when two streams share a source but one has a per-endpoint sub-limit?** Some APIs limit `/search` separately from everything else. The budget model currently assumes one pool per source.
 11. **How long a window does change-rate inference need before its advice is trustworthy?** A stream polled hourly for two days has 48 samples, which is thin for estimating a 26-hour interval. The advisory needs a confidence gate and should stay silent rather than recommend from noise.
 12. **Does churn inference survive bursty upstreams?** A resource that changes in daily bursts and is otherwise static has a misleading mean interval. Percentiles or a simple burst detector may be needed, or the advisory should decline to speak on high-variance streams.
