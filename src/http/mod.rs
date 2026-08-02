@@ -544,6 +544,24 @@ streams:
         field: $.updated_at
         type: rfc3339
         param: since
+  - name: colliding
+    source: api
+    freshness: 15m
+    request:
+      path: /items
+      params:
+        limit: 50
+        since: seed
+    pagination:
+      strategy: offset
+      page_size: 100
+    records:
+      path: $.data
+      primary_key: $.id
+      cursor:
+        field: $.updated_at
+        type: rfc3339
+        param: since
 "#;
 
     fn client_and_stream() -> (SourceClient, Arc<Stream>) {
@@ -579,6 +597,49 @@ streams:
         assert_eq!(query.get("state").map(String::as_str), Some("all"));
         assert_eq!(query.get("limit").map(String::as_str), Some("100"));
         assert_eq!(query.get("offset").map(String::as_str), Some("200"));
+    }
+
+    #[test]
+    fn pagination_and_cursor_params_override_configured_ones_of_the_same_name() {
+        // A name can easily be declared twice: `pagelen` is both a natural
+        // request parameter and the page-size parameter, and a `since` seed
+        // reads like the obvious way to start a walk. Appending both leaves the
+        // API to choose, and for `offset` that silently corrupts the walk - the
+        // API answers with one page size while the paginator advances by
+        // another, so records are skipped or repeated on every page.
+        let config = Config::parse(CONFIG).expect("config is valid");
+        let stream = Arc::clone(config.stream("colliding").expect("stream exists"));
+        let source = Arc::clone(config.sources.get("api").expect("source exists"));
+        let client = SourceClient::new(source).expect("client builds");
+
+        let page = PageRequest {
+            params: vec![
+                ("limit".to_owned(), "100".to_owned()),
+                ("offset".to_owned(), "200".to_owned()),
+            ],
+            absolute_url: None,
+        };
+        let url = client
+            .url_for(&stream, &page, Some("2026-01-01T00:00:00Z"))
+            .expect("url builds");
+
+        let values = |wanted: &str| -> Vec<String> {
+            url.query_pairs()
+                .filter(|(name, _)| name == wanted)
+                .map(|(_, value)| value.into_owned())
+                .collect()
+        };
+
+        assert_eq!(
+            values("limit"),
+            vec!["100".to_owned()],
+            "the paginator's page size must not be shadowed by a configured one"
+        );
+        assert_eq!(
+            values("since"),
+            vec!["2026-01-01T00:00:00Z".to_owned()],
+            "the stored mark must not be shadowed by a configured seed"
+        );
     }
 
     #[test]

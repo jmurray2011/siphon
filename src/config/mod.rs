@@ -440,6 +440,7 @@ impl Config {
         lints
     }
 
+
     /// Compares the requests the declared targets imply against the ceiling the
     /// operator configured for the source.
     fn freshness_feasibility(&self, name: &str, source: &Source) -> Option<Lint> {
@@ -964,6 +965,46 @@ streams:
     #[test]
     fn an_env_credential_is_not_linted() {
         assert!(parse(MINIMAL).lint().is_empty());
+    }
+
+    #[test]
+    fn a_parameter_the_paginator_also_sets_is_linted() {
+        // The config says `per_page: 100` and the pagination block says the page
+        // size goes in `per_page` too. Only one of them reaches the API, so the
+        // operator is reading a config that does not describe the request.
+        let text = MINIMAL.replace(
+            "      strategy: link_header\n      rel: next",
+            "      strategy: page\n      size_param: per_page",
+        );
+        let lints = parse(&text).lint();
+        assert!(
+            lints.iter().any(|l| l.message.contains("per_page")),
+            "expected a colliding-parameter lint, got {lints:?}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_the_cursor_also_sets_is_linted() {
+        // `cursor.param: since` already owns `since`; seeding it by hand means
+        // the seed is dropped the moment a mark is stored.
+        let text = MINIMAL.replace(
+            "        state: all\n",
+            "        state: all\n        since: 1970-01-01T00:00:00Z\n",
+        );
+        let lints = parse(&text).lint();
+        assert!(
+            lints.iter().any(|l| l.message.contains("since")),
+            "expected a colliding-parameter lint, got {lints:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_parameter_names_are_not_linted() {
+        let lints = parse(MINIMAL).lint();
+        assert!(
+            !lints.iter().any(|l| l.message.contains("also set by")),
+            "nothing collides in the minimal config, got {lints:?}"
+        );
     }
 
     #[test]
