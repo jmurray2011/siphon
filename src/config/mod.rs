@@ -435,11 +435,42 @@ impl Config {
                     message: "`stop_on_seen_key` stops the walk at the first record already stored; records updated in place without moving in sort order will be missed".to_owned(),
                 });
             }
+            lints.extend(Self::colliding_params(stream));
         }
 
         lints
     }
 
+    /// Parameters a stream sets by hand that the paginator or the incremental
+    /// mark sets too.
+    ///
+    /// The request layer resolves the ambiguity in the only safe direction, so
+    /// this is advisory rather than fatal. It is still worth saying: the
+    /// operator is reading a config that does not describe the request that
+    /// goes out, and a page size that looks configured but is ignored is the
+    /// kind of thing found by counting rows weeks later.
+    fn colliding_params(stream: &Stream) -> Vec<Lint> {
+        let mut reserved = stream.paginator.reserved_params();
+        reserved.extend(
+            stream
+                .records
+                .cursor()
+                .and_then(crate::extract::CursorSpec::param),
+        );
+
+        stream
+            .request
+            .params
+            .iter()
+            .filter(|(name, _)| reserved.contains(&name.as_str()))
+            .map(|(name, _)| Lint {
+                subject: stream.name.clone(),
+                message: format!(
+                    "`request.params.{name}` is also set by pagination or the incremental cursor; the configured value is ignored"
+                ),
+            })
+            .collect()
+    }
 
     /// Compares the requests the declared targets imply against the ceiling the
     /// operator configured for the source.

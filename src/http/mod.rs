@@ -262,8 +262,31 @@ impl SourceClient {
                 })
                 .unwrap_or_default();
 
+            // The mark goes in one place or the other, never both; the config
+            // layer refuses a stream that declares both spellings.
+            let cursor_param = if stream.request.interpolates_cursor() || cursor.is_none() {
+                None
+            } else {
+                stream
+                    .records
+                    .cursor()
+                    .and_then(super::extract::CursorSpec::param)
+            };
+
             let mut query = url.query_pairs_mut();
             for (name, value) in &stream.request.params {
+                // Whatever the paginator or the mark sets for this page wins
+                // over a configured parameter of the same name. Emitting both
+                // leaves the API to choose, and for `offset` the choice is
+                // silently destructive: the API answers with one page size
+                // while the paginator advances by another, so every page skips
+                // or repeats records. `validate` lints the config that gets
+                // here, but the request itself must be unambiguous regardless.
+                if page.params.iter().any(|(taken, _)| taken == name)
+                    || cursor_param == Some(name.as_str())
+                {
+                    continue;
+                }
                 // A parameter carrying `{{ cursor }}` gets the mark spliced in.
                 // Everything else was fully resolved at config load.
                 let resolved = if stream.request.interpolates_cursor() && !interpolate.is_empty() {
@@ -277,18 +300,8 @@ impl SourceClient {
             for (name, value) in &page.params {
                 query.append_pair(name, value);
             }
-            // The mark goes in one place or the other, never both; the config
-            // layer refuses a stream that declares both spellings.
-            if !stream.request.interpolates_cursor() {
-                if let Some(value) = cursor {
-                    if let Some(param) = stream
-                        .records
-                        .cursor()
-                        .and_then(super::extract::CursorSpec::param)
-                    {
-                        query.append_pair(param, value);
-                    }
-                }
+            if let (Some(param), Some(value)) = (cursor_param, cursor) {
+                query.append_pair(param, value);
             }
         }
         self.apply_query_auth(&mut url);

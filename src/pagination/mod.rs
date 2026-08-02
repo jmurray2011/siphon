@@ -234,6 +234,34 @@ impl Paginator {
         }
     }
 
+    /// The query parameters this strategy sets for itself.
+    ///
+    /// A stream that also declares one of these under `request.params` is
+    /// saying the same thing twice. The paginator's value is the one its own
+    /// arithmetic depends on, so that is the one that reaches the API; this
+    /// list is what lets `validate` say so before a walk goes wrong.
+    #[must_use]
+    pub fn reserved_params(&self) -> Vec<&str> {
+        match &self.strategy {
+            Strategy::Offset {
+                limit_param,
+                offset_param,
+                ..
+            } => vec![limit_param.as_str(), offset_param.as_str()],
+            Strategy::Page {
+                page_param,
+                size_param,
+                ..
+            } => {
+                let mut names = vec![page_param.as_str()];
+                names.extend(size_param.as_deref());
+                names
+            }
+            Strategy::Cursor { cursor_param, .. } => vec![cursor_param.as_str()],
+            Strategy::LinkHeader { .. } | Strategy::Single => Vec::new(),
+        }
+    }
+
     /// True when the stream stops as soon as it sees a record it already stored.
     #[must_use]
     pub const fn stops_on_seen_key(&self) -> bool {
