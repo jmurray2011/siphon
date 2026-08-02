@@ -302,6 +302,23 @@ expands over records the API returns.
 `for_each` takes one variable. Two tiers of freshness means two blocks, which is
 also the honest way to write it.
 
+### A private base URL
+
+`base_url` accepts `${ENV_VAR}`, so a per-tenant or self-hosted instance URL does
+not have to be written into a file that lives in a repo:
+
+```yaml
+sources:
+  jira:
+    base_url: ${JIRA_BASE_URL}
+```
+
+Unlike a credential this resolves at load rather than at request time, because
+the URL has to parse for the config to validate at all. The cost is that
+`siphon validate` needs the variable set - run it under whatever supplies the
+rest of the environment. An unset variable is an error naming the variable, never
+a silent fallback.
+
 ### Pagination strategies
 
 | Strategy | Required | Termination |
