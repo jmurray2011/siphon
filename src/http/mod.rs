@@ -273,18 +273,22 @@ impl SourceClient {
                     .and_then(super::extract::CursorSpec::param)
             };
 
+            // Every name the strategy owns, not merely the ones it happened to
+            // emit for this page: the cursor strategy sends nothing until it
+            // has a token, and keying on that would keep a configured value on
+            // page one and drop it from page two. This is the same list
+            // `validate` lints against, so the warning and the request agree.
+            let reserved = stream.paginator.reserved_params();
+
             let mut query = url.query_pairs_mut();
             for (name, value) in &stream.request.params {
-                // Whatever the paginator or the mark sets for this page wins
-                // over a configured parameter of the same name. Emitting both
-                // leaves the API to choose, and for `offset` the choice is
-                // silently destructive: the API answers with one page size
-                // while the paginator advances by another, so every page skips
-                // or repeats records. `validate` lints the config that gets
-                // here, but the request itself must be unambiguous regardless.
-                if page.params.iter().any(|(taken, _)| taken == name)
-                    || cursor_param == Some(name.as_str())
-                {
+                // Whatever the paginator or the mark owns wins over a
+                // configured parameter of the same name. Emitting both leaves
+                // the API to choose, and for `offset` the choice is silently
+                // destructive: the API answers with one page size while the
+                // paginator advances by another, so every page skips or repeats
+                // records.
+                if reserved.contains(&name.as_str()) || cursor_param == Some(name.as_str()) {
                     continue;
                 }
                 // A parameter carrying `{{ cursor }}` gets the mark spliced in.
