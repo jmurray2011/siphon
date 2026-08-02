@@ -683,6 +683,41 @@ async fn a_fatal_error_on_one_stream_does_not_stop_another() {
 }
 
 #[tokio::test]
+async fn a_paginator_that_cannot_skip_still_records_the_page_it_gave_up_on() {
+    // Every other quarantine test drives `offset`, which can always compute the
+    // next page and step over a poison one. A cursor paginator cannot: the only
+    // source of the next token is the response that just failed, so it stops
+    // instead. That is a different branch, and it is the one a real Jira mirror
+    // took in production - a run reported `partial` with `stop_reason:
+    // quarantined` while `_siphon_quarantine` was empty.
+    //
+    // `partial` is a claim that the mirror has a gap. The claim is only honest
+    // if the gap is written down, because the record is the only thing that
+    // says which page to go and look at.
+    let api = MockApi::spawn(|_| Reply::status(404)).await;
+
+    let fixture = fixture(&api.base_url(), QUERY_LANGUAGE_STREAM);
+    let app = app(&fixture).await;
+
+    let report = sync(&app, "issues", false).await;
+
+    assert_eq!(report.status, RunStatus::Partial, "{report:?}");
+    assert_eq!(
+        report.stop_reason.as_deref(),
+        Some("quarantined"),
+        "{report:?}"
+    );
+    assert_eq!(
+        app.store
+            .quarantined_count("issues")
+            .await
+            .expect("quarantine count"),
+        1,
+        "the run reported a gap but nothing recorded which page it was"
+    );
+}
+
+#[tokio::test]
 async fn a_wholly_broken_endpoint_stops_instead_of_quarantining_forever() {
     // Every page 404s. A positional paginator can always compute a next offset,
     // so without a bound the walk would quarantine and skip until the offset
