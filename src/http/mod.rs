@@ -656,6 +656,21 @@ streams:
     }
 
     #[test]
+    fn a_credential_error_does_not_restate_its_own_cause() {
+        // Errors reach the operator through `{:#}`, which walks the source
+        // chain. A variant that interpolates its own `#[source]` as well prints
+        // the underlying failure twice, which reads like two separate problems.
+        let error = HttpError::Secret {
+            source_name: "api".to_owned(),
+            source: SecretError::EnvMissing("TOKEN".to_owned()),
+        };
+        assert!(
+            !format!("{error}").contains("is not set"),
+            "the variant restates its cause: {error}"
+        );
+    }
+
+    #[test]
     fn url_injects_the_cursor_into_the_configured_param() {
         let (client, stream) = client_and_stream();
         let page = PageRequest {
