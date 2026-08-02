@@ -178,10 +178,9 @@ impl App {
         for (name, source) in &config.sources {
             clients.insert(
                 name.clone(),
-                Arc::new(
-                    SourceClient::new(Arc::clone(source))
-                        .with_context(|| format!("building client for source `{name}`"))?,
-                ),
+                // No added context: every `HttpError` already names the source
+                // it failed on, and restating it here reads as two failures.
+                Arc::new(SourceClient::new(Arc::clone(source))?),
             );
 
             // A learned ceiling survives restarts, so a deploy does not cost a

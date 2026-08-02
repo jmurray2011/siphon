@@ -24,7 +24,7 @@ use crate::store::Validator;
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
     /// A credential could not be resolved.
-    #[error("source `{source_name}`: {source}")]
+    #[error("cannot resolve a credential for source `{source_name}`")]
     Secret {
         /// The source whose credential it is.
         source_name: String,
