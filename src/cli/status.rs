@@ -4,18 +4,104 @@
 //! an operator actually wants, and it is only computable because freshness is
 //! declared as a requirement rather than implied by a cron expression.
 
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
 
 use crate::cli::App;
+use crate::clock::Timestamp;
 use crate::config::duration::format_duration;
 use crate::config::Config;
 use crate::governor::{attainment, Priority};
+use crate::store::{Checkpoint, RunSummary, Store, StoreError};
 
 /// The window `ATTAIN` is computed over.
 const ATTAINMENT_WINDOW: Duration = Duration::from_secs(7 * 24 * 3_600);
+
+/// What reporting needs from a store, which is strictly less than a store does.
+///
+/// Reporting reads; it never writes, never checkpoints and never quarantines.
+/// Naming that separately is what lets a second store target be checked against
+/// the five questions `status` actually asks, rather than against the whole
+/// surface of whichever implementation happened to exist first.
+///
+/// The methods spell out `impl Future + Send` rather than using `async fn`,
+/// because an `async fn` in a public trait leaves the returned future without a
+/// `Send` bound and the caller no way to add one - which the governor's spawned
+/// tasks need.
+pub trait ReportStore {
+    /// The stream's stored checkpoint, defaulted if it has never run.
+    fn checkpoint(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Checkpoint, StoreError>> + Send;
+
+    /// When the stream first ran, so a young stream is not scored over a window
+    /// that predates it.
+    fn first_run_at(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Option<Timestamp>, StoreError>> + Send;
+
+    /// Timestamps of successful runs at or after `since`.
+    fn successes_since(
+        &self,
+        stream: &str,
+        since: Timestamp,
+    ) -> impl Future<Output = Result<Vec<Timestamp>, StoreError>> + Send;
+
+    /// How many pages of this stream are quarantined.
+    fn quarantined_count(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<u32, StoreError>> + Send;
+
+    /// The most recent run, if there has been one.
+    fn last_run(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Option<RunSummary>, StoreError>> + Send;
+}
+
+impl ReportStore for Store {
+    fn checkpoint(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Checkpoint, StoreError>> + Send {
+        Self::checkpoint(self, stream)
+    }
+
+    fn first_run_at(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Option<Timestamp>, StoreError>> + Send {
+        Self::first_run_at(self, stream)
+    }
+
+    fn successes_since(
+        &self,
+        stream: &str,
+        since: Timestamp,
+    ) -> impl Future<Output = Result<Vec<Timestamp>, StoreError>> + Send {
+        Self::successes_since(self, stream, since)
+    }
+
+    fn quarantined_count(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<u32, StoreError>> + Send {
+        Self::quarantined_count(self, stream)
+    }
+
+    fn last_run(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Option<RunSummary>, StoreError>> + Send {
+        Self::last_run(self, stream)
+    }
+}
 
 /// Parses and checks a config without touching the network.
 ///
@@ -70,38 +156,17 @@ pub async fn report(app: &App) -> anyhow::Result<()> {
     );
 
     for stream in &app.config.streams {
-        let checkpoint = app.store.checkpoint(&stream.name).await?;
-        let last_ok = checkpoint.last_success_at;
+        let read = read_stream(&app.store, stream, now, window_start).await?;
+        let last_ok = read.last_ok;
         let lag = last_ok.map(|at| now.saturating_since(at));
+        let attain = read.attain;
 
-        let attain = match stream.freshness {
-            Some(freshness) => {
-                // A stream is only accountable for the time it has existed:
-                // scoring one that started an hour ago against seven days would
-                // report a perfectly healthy stream as a near-total failure.
-                let first_run = app.store.first_run_at(&stream.name).await?;
-                let from = first_run.map_or(window_start, |at| at.max(window_start));
-
-                // Coverage bought just before the window still counts inside it,
-                // so the query reaches back one target beyond the window edge.
-                let successes = app
-                    .store
-                    .successes_since(&stream.name, from.saturating_sub(freshness))
-                    .await?;
-                attainment(&successes, from, now, freshness)
-                    .map(|ratio| format!("{:.1}%", ratio * 100.0))
-            }
-            None => None,
-        };
-
-        let quarantined = app.store.quarantined_count(&stream.name).await?;
-        let last_run = app.store.last_run(&stream.name).await?;
         let state = describe_state(
             stream.priority,
             stream.freshness,
             lag,
-            quarantined,
-            last_run.as_ref().and_then(|r| r.status.as_deref()),
+            read.quarantined,
+            read.last_status.as_deref(),
         );
 
         println!(
@@ -125,6 +190,53 @@ pub async fn report(app: &App) -> anyhow::Result<()> {
     println!();
     print_budgets(app);
     Ok(())
+}
+
+/// What `status` reads from the store for one stream.
+struct StreamRead {
+    last_ok: Option<Timestamp>,
+    attain: Option<String>,
+    quarantined: u32,
+    last_status: Option<String>,
+}
+
+/// Reads one stream's status. Generic over the store so a second target is
+/// checked against these five questions and nothing else.
+async fn read_stream(
+    store: &impl ReportStore,
+    stream: &crate::config::Stream,
+    now: Timestamp,
+    window_start: Timestamp,
+) -> Result<StreamRead, StoreError> {
+    let checkpoint = store.checkpoint(&stream.name).await?;
+    let last_ok = checkpoint.last_success_at;
+
+    let attain = match stream.freshness {
+        Some(freshness) => {
+            // A stream is only accountable for the time it has existed:
+            // scoring one that started an hour ago against seven days would
+            // report a perfectly healthy stream as a near-total failure.
+            let first_run = store.first_run_at(&stream.name).await?;
+            let from = first_run.map_or(window_start, |at| at.max(window_start));
+
+            // Coverage bought just before the window still counts inside it,
+            // so the query reaches back one target beyond the window edge.
+            let successes = store
+                .successes_since(&stream.name, from.saturating_sub(freshness))
+                .await?;
+            attainment(&successes, from, now, freshness)
+                .map(|ratio| format!("{:.1}%", ratio * 100.0))
+        }
+        None => None,
+    };
+
+    let last_run = store.last_run(&stream.name).await?;
+    Ok(StreamRead {
+        last_ok,
+        attain,
+        quarantined: store.quarantined_count(&stream.name).await?,
+        last_status: last_run.and_then(|run| run.status),
+    })
 }
 
 fn stream_row(
