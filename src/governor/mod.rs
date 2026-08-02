@@ -138,6 +138,14 @@ impl Governor {
         self.wake.notify_waiters();
     }
 
+    /// Gives back a slot reserved for an attempt that never reached the API.
+    pub fn refund(&self, source: &str) {
+        if let Some(budget) = self.lock().budgets.get_mut(source) {
+            budget.refund_request();
+        }
+        self.wake.notify_waiters();
+    }
+
     /// Folds a rate limiting response into the source's budget.
     pub fn observe_rate_limited(&self, source: &str, observed: &LimitHeaders) {
         let now = self.clock.now();

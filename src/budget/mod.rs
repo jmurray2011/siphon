@@ -339,6 +339,22 @@ impl Budget {
         self.last_grant = Some(local_now);
     }
 
+    /// Gives back the slot reserved for a request that never reached the API.
+    ///
+    /// A transport failure carries no headers, so nothing clears the in-flight
+    /// tally for it. Left counted, every attempt that died on the wire would
+    /// lower the believed allowance for the rest of the window - and since that
+    /// belief only ever shrinks within a window, the error compounds rather
+    /// than washing out. On a source with a tight budget and a flaky link that
+    /// is a real loss: five attempts at one retry budget is most of a minute's
+    /// allowance on an API that grants sixty an hour.
+    ///
+    /// Refunding can only ever over-count, and the next reading corrects that
+    /// for free: an observed count lower than the belief always wins.
+    pub fn refund_request(&mut self) {
+        self.spent_since_observation = self.spent_since_observation.saturating_sub(1);
+    }
+
     /// Requests per second siphon may spend right now.
     #[must_use]
     pub fn spend_rate(&self, local_now: Timestamp) -> f64 {
@@ -589,6 +605,32 @@ mod tests {
             budget.effective_remaining(),
             Some(19),
             "a stale counter restored budget that had already been spent"
+        );
+    }
+
+    #[test]
+    fn attempts_that_never_reached_the_api_are_not_charged_for() {
+        // A slot is reserved before the request goes out, and a transport
+        // failure comes back with no headers at all - so the reading that would
+        // normally clear the tally never arrives. Because the belief only
+        // shrinks within a window, an uncorrected phantom spend is permanent
+        // until the window rolls.
+        let mut budget = Budget::new(policy(Some(60), 1.0));
+        budget.observe(&observed(50, 60, 3_600, 0), t(0));
+
+        // A full retry budget of attempts dies on the wire.
+        for _ in 0..4 {
+            budget.record_request(t(0));
+            budget.refund_request();
+        }
+        // The fifth lands, and the API accounts for the one it actually served.
+        budget.record_request(t(0));
+        budget.observe(&observed(49, 60, 3_600, 0), t(1));
+
+        assert_eq!(
+            budget.effective_remaining(),
+            Some(49),
+            "attempts the API never saw were charged against the window"
         );
     }
 

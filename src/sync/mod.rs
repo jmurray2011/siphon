@@ -534,6 +534,13 @@ impl SyncWorker {
                 }
 
                 ResponseClass::Retryable => {
+                    // No status at all means nothing was served: a reset, a
+                    // timeout or a DNS blip. The slot reserved for it was never
+                    // spent, and a transport failure carries no headers to
+                    // correct the tally later, so hand it back here.
+                    if response.status.is_none() {
+                        self.governor.refund(&stream.source);
+                    }
                     self.governor.observe(&stream.source, &response.limits);
                     if attempt >= retry.max_attempts {
                         return Ok(Fetched::GiveUp(
