@@ -12,6 +12,7 @@
 //! ```sh
 //! curl -s -o /dev/null -D - https://api.github.com/repos/rust-lang/rust/issues?per_page=1
 //! curl -s -o /dev/null -D - https://gitlab.com/api/v4/projects/278964/issues?per_page=1
+//! curl -s -o /dev/null -D - https://api.bitbucket.org/2.0/repositories/atlassian?pagelen=1
 //! ```
 //!
 //! What the survey found:
@@ -21,6 +22,11 @@
 //! - GitLab publishes the IETF `RateLimit-*` fields with a **sixty-second**
 //!   window aligned to the minute - two orders of magnitude shorter than
 //!   GitHub's, from the same parse.
+//! - Bitbucket publishes the same field names as GitHub but means different
+//!   things by them: a compound limit carrying its own window length, a reset
+//!   expressed as a delta, and - the finding that mattered - a counter that is
+//!   **not monotonic**. It is served by several nodes whose counts disagree and
+//!   move in both directions, so the newest value is not the truest one.
 //! - crates.io and PyPI publish no rate-limit headers at all. The configured
 //!   ceiling is not a fallback for these; it is the only signal there is.
 
@@ -75,6 +81,44 @@ const PYPI: &[(&str, &str)] = &[
     ("date", "Sat, 01 Aug 2026 22:50:11 GMT"),
     ("etag", "\"PIda7csZtWyaGzro3RbDQA\""),
 ];
+
+/// Captured from `api.bitbucket.org/2.0`, unauthenticated: eight requests
+/// inside one two-second burst, as `(date, remaining, reset, served-by)`.
+///
+/// Five distinct nodes answered, and the count moves in both directions. Even a
+/// single node - `449d70f80336`, at positions 2, 4 and 7 - reported 57, then 54,
+/// then 58. Nothing here is a decrementing counter.
+/// `(second, remaining, reset, served-by)`. The whole burst lands inside one
+/// minute, so only the seconds differ.
+const BITBUCKET_BURST: &[(&str, &str, &str, &str)] = &[
+    ("34", "55", "3506", "95f53111acaf"),
+    ("35", "57", "3506", "449d70f80336"),
+    ("35", "59", "3505", "7121e3271ceb"),
+    ("35", "54", "3505", "449d70f80336"),
+    ("36", "59", "3505", "7121e3271ceb"),
+    ("36", "59", "3504", "34438306376b"),
+    ("36", "58", "3504", "449d70f80336"),
+    ("36", "58", "3504", "bcf6d5697d77"),
+];
+
+/// The minute the burst was captured in.
+const BITBUCKET_MINUTE: &str = "Sun, 02 Aug 2026 00:01:";
+
+/// Bitbucket sends the current quota and the policy that produced it in one
+/// field: 60 per window, window 3600s.
+const BITBUCKET_LIMIT: &str = "60, 60;w=3600";
+
+fn bitbucket(index: usize) -> Vec<(String, String)> {
+    let (second, remaining, reset, served_by) = BITBUCKET_BURST[index];
+    let date = format!("{BITBUCKET_MINUTE}{second} GMT");
+    owned(&[
+        ("date", date.as_str()),
+        ("x-ratelimit-limit", BITBUCKET_LIMIT),
+        ("x-ratelimit-remaining", remaining),
+        ("x-ratelimit-reset", reset),
+        ("x-served-by", served_by),
+    ])
+}
 
 fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
@@ -251,6 +295,84 @@ fn a_validator_is_usable_even_when_the_budget_is_not() {
         .map(|(_, value)| value.clone());
     assert_eq!(etag.as_deref(), Some("\"PIda7csZtWyaGzro3RbDQA\""));
     assert!(!measured(PYPI).is_informative());
+}
+
+#[test]
+fn bitbucket_headers_are_read_despite_a_compound_limit_and_a_delta_reset() {
+    let captured = bitbucket(0);
+    let server_date = Timestamp::from_secs(1_785_628_894);
+    let read = headers::read(&captured, None, server_date);
+
+    // `60, 60;w=3600` is the current quota followed by the policy that set it.
+    // The leading integer is the number to pace against.
+    assert_eq!(read.limit, Some(60));
+    assert_eq!(read.remaining, Some(55));
+    assert_eq!(read.server_date, Some(server_date));
+
+    // 3506 is seconds-until-reset, not a unix instant. Read as an instant it
+    // would land in 1970 and the window would be thrown out as implausible,
+    // dropping siphon back to the configured ceiling on an API that does in
+    // fact publish a usable window.
+    let reset_at = read.reset_at.expect("a reset");
+    assert_eq!(reset_at.diff_millis(server_date), 3_506_000);
+
+    // And it lands on the hour, so the window is wall-clock aligned like
+    // GitLab's minute rather than rolling from first use.
+    assert_eq!(reset_at.as_secs() % 3_600, 0);
+}
+
+#[test]
+fn the_bitbucket_counter_moves_in_both_directions() {
+    // GitHub's counter is worth pacing against because it decrements exactly
+    // once per request. This one does not decrement at all reliably.
+    let counts: Vec<u64> = (0..BITBUCKET_BURST.len())
+        .map(|index| {
+            headers::read(&bitbucket(index), None, Timestamp::EPOCH)
+                .remaining
+                .expect("a remaining count")
+        })
+        .collect();
+
+    assert_eq!(counts, vec![55, 57, 59, 54, 59, 59, 58, 58]);
+    assert!(
+        counts.windows(2).any(|pair| pair[1] > pair[0]),
+        "the finding this fixture exists to pin is that the count rises"
+    );
+}
+
+#[test]
+fn a_non_monotonic_counter_never_restores_spent_budget() {
+    // The burst replayed through the governor, one request issued per response
+    // exactly as a real walk would. Taking each newest count verbatim lets the
+    // stalest node hand the allowance back, and because an observation also
+    // clears the in-flight tally, siphon's belief climbs while it is spending -
+    // then sprints into a 429 at the end of the window.
+    let mut budget = budget(Some(60));
+    let mut believed = u64::MAX;
+
+    for index in 0..BITBUCKET_BURST.len() {
+        let captured = bitbucket(index);
+        let server_date = headers::read(&captured, None, Timestamp::EPOCH)
+            .server_date
+            .expect("every fixture carries a Date header");
+        let read = headers::read(&captured, None, server_date);
+
+        budget.record_request(server_date);
+        budget.observe(&read, server_date);
+
+        let now = budget.effective_remaining().expect("a measured budget");
+        assert!(
+            now <= believed,
+            "belief rose from {believed} to {now} at response {index} while spending"
+        );
+        believed = now;
+    }
+
+    // Eight requests went out against a first reading of 55.
+    assert_eq!(
+        believed, 48,
+        "eight requests should leave the belief eight below the first reading"
+    );
 }
 
 #[test]

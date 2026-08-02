@@ -548,6 +548,44 @@ mod tests {
     }
 
     #[test]
+    fn a_counter_that_moves_backwards_never_restores_the_allowance() {
+        // Some APIs answer from several nodes whose counters disagree: eight
+        // requests inside two seconds read 55, 57, 59, 54, 59, 59, 58, 58, and a
+        // single node reported 57, 54, 58 in that order. Taking the newest value
+        // verbatim lets the stalest node hand the whole allowance back, and the
+        // in-flight count is zeroed with it, so siphon forgets what it spent.
+        let mut budget = Budget::new(policy(Some(60), 1.0));
+        budget.observe(&observed(59, 60, 3_600, 0), t(0));
+
+        for _ in 0..40 {
+            budget.record_request(t(0));
+        }
+        assert_eq!(budget.effective_remaining(), Some(19));
+
+        budget.observe(&observed(59, 60, 3_600, 0), t(1));
+        assert_eq!(
+            budget.effective_remaining(),
+            Some(19),
+            "a stale counter restored budget that had already been spent"
+        );
+    }
+
+    #[test]
+    fn the_allowance_returns_when_the_window_actually_rolls() {
+        // The guard above must not wedge the source shut: once the window it was
+        // measured against has elapsed, a larger count is the real thing.
+        let mut budget = Budget::new(policy(Some(60), 1.0));
+        budget.observe(&observed(59, 60, 3_600, 0), t(0));
+        for _ in 0..40 {
+            budget.record_request(t(0));
+        }
+        assert_eq!(budget.effective_remaining(), Some(19));
+
+        budget.observe(&observed(60, 60, 7_200, 3_600), t(3_600));
+        assert_eq!(budget.effective_remaining(), Some(60));
+    }
+
+    #[test]
     fn pacing_spreads_the_remaining_budget_over_the_remaining_window() {
         let mut budget = Budget::new(policy(None, 1.0));
         // 10 requests over 100 seconds. The first may go immediately; after it,
