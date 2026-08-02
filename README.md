@@ -268,7 +268,7 @@ parser.
 | Strategy | Required | Termination |
 |---|---|---|
 | `offset` | `page_size`; optional `limit_param`, `offset_param` | short page, or empty page |
-| `page` | none; optional `page_param`, `size_param`, `page_size`, `start_page`, `total_pages_path` | empty page, or the reported total |
+| `page` | none; optional `page_param`, `size_param`, `page_size`, `start_page`, `total_pages_path` | short page when `page_size` is set, empty page, or the reported total |
 | `cursor` | `cursor_param`, `cursor_path` | cursor absent, null or empty |
 | `link_header` | none; optional `rel` (default `next`) | header absent |
 | `none` | none | one request |
