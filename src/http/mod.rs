@@ -557,6 +557,20 @@ streams:
         field: $.updated_at
         type: rfc3339
         param: since
+  - name: token_paged
+    source: api
+    freshness: 15m
+    request:
+      path: /items
+      params:
+        next: seed
+    pagination:
+      strategy: cursor
+      cursor_param: next
+      cursor_path: $.next
+    records:
+      path: $.data
+      primary_key: $.id
   - name: colliding
     source: api
     freshness: 15m
@@ -652,6 +666,32 @@ streams:
             values("since"),
             vec!["2026-01-01T00:00:00Z".to_owned()],
             "the stored mark must not be shadowed by a configured seed"
+        );
+    }
+
+    #[test]
+    fn a_reserved_parameter_is_dropped_on_the_first_page_too() {
+        // The cursor strategy emits nothing until it has a token, so an
+        // override keyed on what the paginator actually sent would keep the
+        // configured value on page one and drop it from page two - the same
+        // walk issuing two different shapes, while `validate` reports flatly
+        // that the value is ignored.
+        let config = Config::parse(CONFIG).expect("config is valid");
+        let stream = Arc::clone(config.stream("token_paged").expect("stream exists"));
+        let source = Arc::clone(config.sources.get("api").expect("source exists"));
+        let client = SourceClient::new(source).expect("client builds");
+
+        let first_page = PageRequest {
+            params: Vec::new(),
+            absolute_url: None,
+        };
+        let url = client
+            .url_for(&stream, &first_page, None)
+            .expect("url builds");
+
+        assert!(
+            !url.query_pairs().any(|(name, _)| name == "next"),
+            "page one kept a parameter the paginator owns: {url}"
         );
     }
 
