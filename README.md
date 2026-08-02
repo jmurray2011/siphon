@@ -94,7 +94,12 @@ without being told which it is looking at.
 APIs surveyed publish nothing at all. `requests_per_hour` is the only signal
 there, and the politeness floor is what protects an API that has neither.
 Conditional requests are independent of this: PyPI publishes no budget but does
-publish an `ETag`, so polling it is still cheap.
+publish an `ETag`, so polling it is still cheap. Independent in the other
+direction too, and this one is easy to get wrong - a 304 is not automatically
+free. GitHub does not charge for one, which is what makes a tight freshness
+target affordable there. Bitbucket decrements the same counter it would for a
+200, so conditional requests buy bandwidth and not budget, and a target has to
+be affordable on request count alone.
 
 **A published counter is not necessarily a counter.** Bitbucket answers from
 several nodes whose rate-limit counters disagree. Eight requests inside two

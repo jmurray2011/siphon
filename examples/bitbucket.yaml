@@ -57,8 +57,14 @@ sources:
       # `x-ratelimit-remaining` is served by several nodes whose tallies
       # disagree and move in both directions. See the survey in the README.
       utilization: 0.8
-    # Bitbucket sends an `ETag` on these endpoints, so unchanged pages cost a
+    # Bitbucket sends an `ETag` on these endpoints, so an unchanged page costs a
     # 304 rather than a full body.
+    #
+    # Note what that does not buy here. Bitbucket decrements
+    # `x-ratelimit-remaining` for a 304 exactly as it would for a 200, so
+    # conditional requests save bandwidth but not budget. On GitHub a 304 is
+    # free, which is what makes a tight freshness target affordable there; that
+    # does not carry over. Size the targets below against request count alone.
     conditional_requests: true
 
 streams:
