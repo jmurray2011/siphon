@@ -78,10 +78,11 @@ responses on 2026-08-01, captured as fixtures in
 |---|---|---|---|---|
 | GitHub | `X-RateLimit-*` | unix seconds | 3600s | Usable; decrements exactly once per request |
 | GitLab | `RateLimit-*` (IETF) | unix seconds | **60s**, aligned to the minute | Usable from the same parse, no configuration |
+| Bitbucket | `X-RateLimit-*` | **delta** seconds | 3600s, aligned to the hour | Readable, but the counter is **not monotonic** |
 | crates.io | none | - | - | No signal at all |
 | PyPI | none (but sends `ETag`) | - | - | No signal at all |
 
-Two things fell out of this that were not obvious from the design:
+Three things fell out of this that were not obvious from the design:
 
 **Window length varies by two orders of magnitude.** GitHub's window is an hour;
 GitLab's is a minute. Both are read correctly from the same auto-detected fields,
@@ -89,11 +90,23 @@ but they produce very different pacing - 0.013 req/s against GitHub versus about
 17 req/s against GitLab - and the window estimator has to converge on each
 without being told which it is looking at.
 
-**A configured ceiling is not a fallback, it is a primary path.** Two of the four
+**A configured ceiling is not a fallback, it is a primary path.** Two of the five
 APIs surveyed publish nothing at all. `requests_per_hour` is the only signal
 there, and the politeness floor is what protects an API that has neither.
 Conditional requests are independent of this: PyPI publishes no budget but does
 publish an `ETag`, so polling it is still cheap.
+
+**A published counter is not necessarily a counter.** Bitbucket answers from
+several nodes whose rate-limit counters disagree. Eight requests inside two
+seconds read 55, 57, 59, 54, 59, 59, 58, 58, and a single node reported 57, then
+54, then 58 - so the newest value is not the truest one, and taking it verbatim
+lets the stalest node hand back an allowance that was already spent. Within a
+window siphon now only ever lowers what it believes is left, and restores it
+only once that window has actually elapsed. The categories are therefore not
+"publishes" and "does not publish" but three: publishes something you can pace
+against, publishes nothing, and publishes something that will mislead you if you
+believe it. The last is the one worth designing for, because it looks like the
+first.
 
 Worth noting for later: GitHub's `X-RateLimit-Resource: core` names the bucket
 the limit belongs to, and `/search` is a separate bucket on the same token. The
@@ -260,6 +273,12 @@ parser.
 Cross-cutting on every strategy: `max_pages` (default 10,000), `stop_on_empty`
 (default true), `stop_on_seen_key` (default false, and linted - it is wrong for
 APIs that update records in place without moving them in sort order).
+
+A parameter the strategy sets for itself - or one that `cursor.param` owns - wins
+over a `request.params` entry of the same name, and `validate` lints the
+duplicate. Sending both would leave the API to choose, and for `offset` the
+choice is silently destructive: the API answers with one page size while the
+paginator advances by another, so every page skips or repeats records.
 
 ## What it guarantees
 
