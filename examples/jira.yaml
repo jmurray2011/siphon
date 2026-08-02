@@ -1,8 +1,8 @@
 # A worked example: mirror Jira issues into SQLite.
 #
+#   export JIRA_BASE_URL=https://your-domain.atlassian.net
 #   export JIRA_EMAIL=you@example.com
 #   export JIRA_API_TOKEN=...
-#   # then edit base_url below to your own instance
 #   siphon validate examples/jira.yaml
 #   siphon test issues --config examples/jira.yaml
 #   siphon run examples/jira.yaml
@@ -27,9 +27,11 @@ defaults:
 
 sources:
   jira:
-    # Edit this. Unlike the credentials below, it is not a secret and is parsed
-    # as a URL when the config loads, so `${ENV}` is not resolved here.
-    base_url: https://your-domain.atlassian.net
+    # A per-tenant site URL, so it comes from the environment rather than being
+    # edited into the file. Unlike the credentials below this resolves at load
+    # rather than at request time, because the URL has to parse for the config
+    # to validate at all - which means `siphon validate` needs it set too.
+    base_url: ${JIRA_BASE_URL}
     auth:
       # Jira Cloud takes the API token as an HTTP basic password alongside the
       # account email, not as a bearer token.
