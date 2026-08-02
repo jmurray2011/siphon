@@ -153,10 +153,13 @@ pub enum ApiKeyLocation {
 }
 
 /// One endpoint to mirror.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawStream {
     /// Unique name; also the key in the store.
+    ///
+    /// May carry `{{ placeholders }}` when `for_each` is used, which is the only
+    /// way the expansions get distinct store keys.
     pub name: String,
     /// Which source this stream pulls from.
     pub source: String,
@@ -174,6 +177,13 @@ pub struct RawStream {
     /// Values for `{{ placeholders }}` in the request.
     #[serde(default)]
     pub vars: BTreeMap<String, Scalar>,
+    /// Expands this block into one stream per value.
+    ///
+    /// A map of one variable to its values. Each expansion gets that variable
+    /// added to its `vars`, so the same block serves twenty projects without
+    /// twenty copies of it existing anywhere.
+    #[serde(default)]
+    pub for_each: BTreeMap<String, Vec<Scalar>>,
     /// How to walk pages.
     pub pagination: PaginationConfig,
     /// How to find records in the response.
@@ -198,7 +208,7 @@ pub enum Direction {
 }
 
 /// The `request` block.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawRequest {
     /// Path appended to the source's `base_url`, with `{{ vars }}` allowed.
@@ -212,7 +222,7 @@ pub struct RawRequest {
 }
 
 /// The `write` block.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawWrite {
     /// How records land in the store.

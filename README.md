@@ -274,6 +274,34 @@ rejecting it means the mark never advances and the mirror re-walks its whole
 history forever while reporting success - a much worse failure than a liberal
 parser.
 
+### One block, many streams
+
+Mirroring twenty projects from one API means twenty streams differing in a single
+value. Writing them out is how a config stops being reviewable, and generating
+them from a script means the config nobody can read is the only one that exists.
+`for_each` expands one block into one stream per value:
+
+```yaml
+streams:
+  - name: issues_{{ project }}     # must vary, or the expansions collide
+    for_each:
+      project: [ABC, DEF, GHI]
+    request:
+      path: /rest/api/3/search/jql
+      params:
+        jql: 'project = "{{ project }}" AND updated >= "{{ cursor }}"'
+    # ...the rest of the block, written once
+```
+
+Each expansion gets the value added to its `vars`, so it reaches the path, the
+params and the name. Expansion happens before validation, so every product is
+checked exactly as if it had been typed out. The values come from the config,
+which is what separates this from the `parent:` key reserved for v0.3 - that one
+expands over records the API returns.
+
+`for_each` takes one variable. Two tiers of freshness means two blocks, which is
+also the honest way to write it.
+
 ### Pagination strategies
 
 | Strategy | Required | Termination |

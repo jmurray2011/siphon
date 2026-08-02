@@ -296,6 +296,14 @@ pub enum ConfigError {
         #[source]
         source: template::TemplateError,
     },
+    /// A `for_each` block could not be expanded.
+    #[error("stream `{stream}`: {message}")]
+    ForEach {
+        /// The stream in question.
+        stream: String,
+        /// What is wrong with it.
+        message: String,
+    },
     /// A stream with a deadline declared no freshness target, or the other way round.
     #[error("stream `{stream}`: {message}")]
     Freshness {
@@ -372,17 +380,19 @@ impl Config {
 
         let mut streams = Vec::with_capacity(raw.streams.len());
         let mut seen = BTreeSet::new();
-        for stream in &raw.streams {
-            if !seen.insert(stream.name.clone()) {
-                return Err(ConfigError::DuplicateStream(stream.name.clone()));
+        for declared in &raw.streams {
+            for stream in expand_for_each(declared)? {
+                if !seen.insert(stream.name.clone()) {
+                    return Err(ConfigError::DuplicateStream(stream.name.clone()));
+                }
+                if !sources.contains_key(&stream.source) {
+                    return Err(ConfigError::UnknownSource {
+                        stream: stream.name.clone(),
+                        source_name: stream.source.clone(),
+                    });
+                }
+                streams.push(Arc::new(build_stream(&stream)?));
             }
-            if !sources.contains_key(&stream.source) {
-                return Err(ConfigError::UnknownSource {
-                    stream: stream.name.clone(),
-                    source_name: stream.source.clone(),
-                });
-            }
-            streams.push(Arc::new(build_stream(stream)?));
         }
 
         Ok(Self {
@@ -562,6 +572,54 @@ fn build_retry(raw: Option<&RawRetry>) -> RetryPolicy {
             .max_backoff
             .map_or(defaults.max_backoff, duration::HumanDuration::get),
     }
+}
+
+/// Expands a `for_each` block into one raw stream per value.
+///
+/// This is deliberately static: the values come from the config, not from
+/// fetched records, which is what separates it from the `parent:` key reserved
+/// for v0.3. A stream without `for_each` passes straight through.
+///
+/// The expansion happens before anything is validated, so each product is
+/// checked exactly as if it had been written out by hand - which is the point.
+/// Twenty near-identical blocks are how a config stops being reviewable.
+fn expand_for_each(raw: &raw::RawStream) -> Result<Vec<raw::RawStream>, ConfigError> {
+    if raw.for_each.is_empty() {
+        return Ok(vec![raw.clone()]);
+    }
+    if raw.for_each.len() > 1 {
+        return Err(ConfigError::ForEach {
+            stream: raw.name.clone(),
+            message: "`for_each` takes one variable; declare the others under `vars`".to_owned(),
+        });
+    }
+
+    // The map holds exactly one entry, checked above, so this loop runs once.
+    let mut expansions = Vec::new();
+    for (variable, values) in &raw.for_each {
+        if values.is_empty() {
+            return Err(ConfigError::ForEach {
+                stream: raw.name.clone(),
+                message: format!("`for_each.{variable}` has no values, so the stream would vanish"),
+            });
+        }
+        for value in values {
+            let mut expanded = raw.clone();
+            expanded.for_each = BTreeMap::new();
+            expanded.vars.insert(variable.clone(), value.clone());
+            // Rendered against the whole var set, not just the loop variable, so
+            // the name can be built from anything the stream already declares.
+            expanded.name =
+                template::render(&raw.name, &raw::scalars(&expanded.vars)).map_err(|source| {
+                    ConfigError::Template {
+                        stream: raw.name.clone(),
+                        source,
+                    }
+                })?;
+            expansions.push(expanded);
+        }
+    }
+    Ok(expansions)
 }
 
 fn build_stream(raw: &raw::RawStream) -> Result<Stream, ConfigError> {
@@ -996,6 +1054,51 @@ streams:
     #[test]
     fn an_env_credential_is_not_linted() {
         assert!(parse(MINIMAL).lint().is_empty());
+    }
+
+    #[test]
+    fn for_each_expands_one_block_into_a_stream_per_value() {
+        // Twenty near-identical blocks differing in a single value is what
+        // drives people to generate configs from a script. Write the shape once.
+        let text = MINIMAL
+            .replace(
+                "  - name: issues\n",
+                "  - name: issues_{{ project }}\n    for_each:\n      project: [ABC, DEF]\n",
+            )
+            .replace(
+                "path: /repos/{{ owner }}/{{ repo }}/issues",
+                "path: /repos/{{ owner }}/{{ repo }}/issues/{{ project }}",
+            );
+
+        let config = parse(&text);
+        let names: Vec<&str> = config.streams.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["issues_ABC", "issues_DEF"]);
+
+        // Each expansion carries its own value all the way into the request.
+        let paths: Vec<&str> = config
+            .streams
+            .iter()
+            .map(|s| s.request.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/repos/rust-lang/rust/issues/ABC",
+                "/repos/rust-lang/rust/issues/DEF"
+            ]
+        );
+    }
+
+    #[test]
+    fn for_each_that_does_not_vary_the_name_is_refused() {
+        // Every expansion would land on the same store key, silently mirroring
+        // several projects on top of each other.
+        let text = MINIMAL.replace(
+            "  - name: issues\n",
+            "  - name: issues\n    for_each:\n      project: [ABC, DEF]\n",
+        );
+        let err = Config::parse(&text).expect_err("duplicate names must be refused");
+        assert!(matches!(err, ConfigError::DuplicateStream(_)), "{err:?}");
     }
 
     #[test]
