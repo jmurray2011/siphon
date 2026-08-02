@@ -257,11 +257,33 @@ impl Budget {
         if let Some(limit) = observed.limit {
             self.limit = Some(limit);
         }
+        // Whether the window this budget was measured against has elapsed, read
+        // before the incoming reset overwrites it.
+        let rolled = self
+            .local_reset_at()
+            .is_none_or(|reset_at| local_now >= reset_at);
+
         if observed.reset_at.is_some() {
             self.reset_at = observed.reset_at;
         }
         if let Some(remaining) = observed.remaining {
-            self.remaining = Some(remaining);
+            // Not every API decrements this counter reliably. Some answer from
+            // several nodes whose counts disagree by a handful of requests and
+            // move in both directions, so the newest value is not the truest
+            // one. Within a window the allowance can only shrink: take the lower
+            // of what was seen and what is left after the spend since the last
+            // observation. A count lower than expected is still believed, since
+            // that is another client sharing the same token.
+            //
+            // The cost of being wrong here is asymmetric. Reading too low means
+            // spending under the limit and mirroring more slowly; reading too
+            // high means sprinting into a 429, which ratchets the source down
+            // and is exactly what the measured budget exists to avoid.
+            let believed = self.effective_remaining();
+            self.remaining = Some(match believed {
+                Some(believed) if !rolled => remaining.min(believed),
+                _ => remaining,
+            });
             self.spent_since_observation = 0;
         }
         self.update_window_estimate(local_now);
