@@ -167,11 +167,17 @@ github              4211/5000      41m12s         1.36       2s  ok
 
 ## Configuration
 
-The config format is the product; everything else is implementation. Two fully
-commented files: [`examples/github.yaml`](examples/github.yaml), and
-[`examples/bitbucket.yaml`](examples/bitbucket.yaml), which runs with no
-credentials and covers the awkward cases - a rate-limit counter that cannot be
-read verbatim, and an incremental mark that lives inside a query expression.
+The config format is the product; everything else is implementation. Three fully
+commented files, each covering a different shape:
+
+| File | Pagination | Incremental mark | Credentials |
+|---|---|---|---|
+| [`github.yaml`](examples/github.yaml) | `link_header` | a `since` parameter | token |
+| [`bitbucket.yaml`](examples/bitbucket.yaml) | `page` | in a query expression, no narrowing | none |
+| [`jira.yaml`](examples/jira.yaml) | `cursor` | in a query expression, narrowed by `format` | email + token |
+
+Start with `bitbucket.yaml`: it runs as written with no credentials, and it
+covers the rate-limit counter that cannot be read verbatim.
 
 ### Sources
 

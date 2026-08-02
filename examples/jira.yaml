@@ -1,0 +1,94 @@
+# A worked example: mirror Jira issues into SQLite.
+#
+#   export JIRA_EMAIL=you@example.com
+#   export JIRA_API_TOKEN=...
+#   # then edit base_url below to your own instance
+#   siphon validate examples/jira.yaml
+#   siphon test issues --config examples/jira.yaml
+#   siphon run examples/jira.yaml
+#
+# This example exists for the case neither of the others cover: an API with no
+# `since` parameter, where the incremental mark is one clause of a query
+# expression rather than a parameter beside it. The same shape applies to SOQL
+# and to an OData `$filter`.
+
+version: 1
+
+store:
+  type: sqlite
+  path: ./data/jira.db
+
+defaults:
+  timeout: 30s
+  retry:
+    max_attempts: 5
+    initial_backoff: 1s
+    max_backoff: 5m
+
+sources:
+  jira:
+    # Edit this. Unlike the credentials below, it is not a secret and is parsed
+    # as a URL when the config loads, so `${ENV}` is not resolved here.
+    base_url: https://your-domain.atlassian.net
+    auth:
+      # Jira Cloud takes the API token as an HTTP basic password alongside the
+      # account email, not as a bearer token.
+      type: basic
+      username: ${JIRA_EMAIL}
+      password: ${JIRA_API_TOKEN}
+    headers:
+      Accept: application/json
+    budget:
+      # A deliberately conservative ceiling. Jira's published limits vary by
+      # plan and endpoint, so this is the floor siphon paces at until the API
+      # says otherwise; if it returns `X-RateLimit-*` or the IETF `RateLimit-*`
+      # fields they are detected without configuration, and a 429 with
+      # `Retry-After` is honoured either way.
+      requests_per_hour: 500
+      utilization: 0.8
+    conditional_requests: true
+
+streams:
+  - name: issues
+    source: jira
+    freshness: 15m
+    priority: high
+    request:
+      path: /rest/api/3/search/jql
+      params:
+        # The mark is interpolated into the expression. Sorting ascending by the
+        # same field the cursor tracks is what makes the walk resumable: a run
+        # that dies halfway leaves the mark on the last issue it stored.
+        jql: 'project = {{ project }} AND updated >= "{{ cursor }}" ORDER BY updated ASC'
+        # Ask only for the fields that get used. Issue payloads are large and
+        # the raw layer stores them verbatim.
+        fields: summary,status,updated
+        maxResults: 100
+    vars:
+      project: ABC
+    # Two unrelated cursors live in this stream. This one walks pages: the
+    # search endpoint returns an opaque `nextPageToken` and omits it on the last
+    # page, which is what ends the walk.
+    pagination:
+      strategy: cursor
+      cursor_param: nextPageToken
+      cursor_path: $.nextPageToken
+    records:
+      path: $.issues
+      primary_key: $.id
+      # This one is the incremental high-water mark, and it is the reason the
+      # stream is cheap to keep fresh.
+      cursor:
+        field: $.fields.updated
+        type: rfc3339
+        # Required whenever `{{ cursor }}` is used: the first run has no stored
+        # mark and there is nothing sensible to substitute.
+        initial: "1970-01-01 00:00"
+        # Jira emits `2021-05-04T22:10:32.221+0100` but JQL accepts only a
+        # narrower form, and feeding the emitted value straight back is
+        # *accepted and matches nothing* - the stream would report `ok` forever
+        # while mirroring no new data. The mark is stored exactly as it arrived
+        # and narrowed only on the way out, in the offset it arrived in.
+        format: "%Y-%m-%d %H:%M"
+    write:
+      mode: upsert
