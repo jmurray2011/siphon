@@ -111,6 +111,9 @@ streams:
         sort: updated_on
     vars:
       workspace: atlassian
+      # Illustrative, and not ours: a small public repository with a handful of
+      # pull requests. Point it at your own. If it is ever made private only the
+      # live commands break - `validate` makes no network calls.
       repo: forge-presentations
     pagination:
       strategy: page
