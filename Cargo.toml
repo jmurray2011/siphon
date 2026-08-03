@@ -37,6 +37,12 @@ tokio = { version = "1", features = [
     "sync",
     "signal",
 ] }
+# `runtime` is what provides `connect()`; without it only a pre-made stream can
+# be used. No TLS feature: this speaks plaintext, which is fine on loopback and
+# is not fine across a network - see `postgres::PgStore::connect`.
+tokio-postgres = { version = "0.7.18", default-features = false, features = [
+    "runtime",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"

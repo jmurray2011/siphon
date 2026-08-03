@@ -9,6 +9,7 @@
 //! not within a write. Calls are async wrappers over `spawn_blocking` so a slow
 //! commit never stalls the executor.
 
+pub mod postgres;
 pub mod schema;
 
 use std::collections::BTreeMap;
@@ -30,6 +31,9 @@ pub enum StoreError {
     /// The database rejected a statement or could not be opened.
     #[error("database error")]
     Sqlite(#[from] rusqlite::Error),
+    /// The Postgres server rejected a statement, or could not be reached.
+    #[error("postgres error")]
+    Postgres(#[from] tokio_postgres::Error),
     /// The database directory could not be created.
     #[error("cannot create database directory `{path}`")]
     Directory {
