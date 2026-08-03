@@ -17,13 +17,16 @@
 //! | `INTEGER PRIMARY KEY` | `BIGSERIAL PRIMARY KEY` | SQLite aliases the rowid and assigns it; Postgres needs to be told |
 //! | `STRICT` | - | Postgres has no permissive mode to opt out of |
 
+use std::future::Future;
 use std::sync::Arc;
 
 use tokio_postgres::Client;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, warn};
 
-use super::StoreError;
+use super::{Checkpoint, RunSummary, StoreError};
+use crate::cli::status::ReportStore;
+use crate::clock::Timestamp;
 
 /// The schema, applied on connect.
 ///
@@ -100,6 +103,13 @@ CREATE TABLE IF NOT EXISTS _siphon_quarantine (
   PRIMARY KEY (stream, page_state)
 );
 ";
+
+/// Advisory-lock key that serializes schema creation across processes.
+///
+/// Arbitrary but fixed: any two siphon processes must pick the same number for
+/// the lock to mean anything, and it only has to avoid colliding with whatever
+/// else uses advisory locks in the same database.
+const SCHEMA_LOCK_KEY: i64 = 0x5169_686f_6e00_0001;
 
 /// Builds the TLS connector from the host's trust store.
 ///
@@ -186,7 +196,26 @@ impl PgStore {
             }
         });
 
-        client.batch_execute(DDL).await?;
+        // `CREATE TABLE IF NOT EXISTS` is not safe to run concurrently. The
+        // existence check and the create are not atomic, so two processes
+        // starting together can both pass the check and the loser fails on
+        // `pg_type_typname_nsp_index`. SQLite never showed this because one
+        // embedded connection has nobody to race; a shared server is the whole
+        // point here, so serialize on an advisory lock and let the second
+        // process wait and find the tables already there.
+        //
+        // The unlock is not conditional on success: holding a session lock after
+        // a failed migration would wedge every later start against a server that
+        // is merely unmigrated.
+        client
+            .query("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK_KEY])
+            .await?;
+        let migrated = client.batch_execute(DDL).await;
+        client
+            .query("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK_KEY])
+            .await?;
+        migrated?;
+
         Ok(Self { client })
     }
 
@@ -205,5 +234,139 @@ impl PgStore {
             .await?;
         let count: i64 = row.get(0);
         Ok(count.try_into().unwrap_or(0))
+    }
+}
+
+impl PgStore {
+    /// The stream's checkpoint, defaulted when it has never run.
+    async fn read_checkpoint(&self, stream: &str) -> Result<Checkpoint, StoreError> {
+        let found = self
+            .client
+            .query_opt(
+                "SELECT cursor_val, page_state, last_run_at, last_success_at, records_seen
+                 FROM _siphon_state WHERE stream = $1",
+                &[&stream],
+            )
+            .await?;
+
+        // A stream that has never run has no row, and that is not an error: the
+        // default checkpoint is what tells the first walk to start at the top.
+        let Some(row) = found else {
+            return Ok(Checkpoint::default());
+        };
+
+        let records_seen: i64 = row.get(4);
+        Ok(Checkpoint {
+            cursor_val: row.get(0),
+            page_state: row.get(1),
+            last_run_at: row.get::<_, Option<i64>>(2).map(Timestamp::from_millis),
+            last_success_at: row.get::<_, Option<i64>>(3).map(Timestamp::from_millis),
+            records_seen: records_seen.max(0).unsigned_abs(),
+        })
+    }
+
+    /// When the stream first ran.
+    async fn read_first_run_at(&self, stream: &str) -> Result<Option<Timestamp>, StoreError> {
+        let row = self
+            .client
+            .query_one(
+                "SELECT MIN(started_at) FROM _siphon_runs WHERE stream = $1",
+                &[&stream],
+            )
+            .await?;
+        Ok(row.get::<_, Option<i64>>(0).map(Timestamp::from_millis))
+    }
+
+    /// Timestamps of runs that left the stream current, at or after `since`.
+    async fn read_successes_since(
+        &self,
+        stream: &str,
+        since: Timestamp,
+    ) -> Result<Vec<Timestamp>, StoreError> {
+        // `not_modified` counts as a success: a 304 confirms the mirror is
+        // current, which is exactly what attainment measures.
+        let rows = self
+            .client
+            .query(
+                "SELECT ended_at FROM _siphon_runs
+                 WHERE stream = $1 AND ended_at >= $2
+                   AND status IN ('ok', 'partial', 'not_modified')
+                 ORDER BY ended_at",
+                &[&stream, &since.as_millis()],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| Timestamp::from_millis(row.get::<_, i64>(0)))
+            .collect())
+    }
+
+    /// How many pages of this stream are set aside.
+    async fn read_quarantined_count(&self, stream: &str) -> Result<u32, StoreError> {
+        let row = self
+            .client
+            .query_one(
+                "SELECT COUNT(*) FROM _siphon_quarantine WHERE stream = $1",
+                &[&stream],
+            )
+            .await?;
+        let count: i64 = row.get(0);
+        Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+    }
+
+    /// The most recent finished run, whatever its outcome.
+    async fn read_last_run(&self, stream: &str) -> Result<Option<RunSummary>, StoreError> {
+        let found = self
+            .client
+            .query_opt(
+                "SELECT status, ended_at, error FROM _siphon_runs
+                 WHERE stream = $1 AND ended_at IS NOT NULL
+                 ORDER BY ended_at DESC LIMIT 1",
+                &[&stream],
+            )
+            .await?;
+        Ok(found.map(|row| RunSummary {
+            status: row.get(0),
+            ended_at: row.get::<_, Option<i64>>(1).map(Timestamp::from_millis),
+            error: row.get(2),
+        }))
+    }
+}
+
+impl ReportStore for PgStore {
+    fn checkpoint(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Checkpoint, StoreError>> + Send {
+        self.read_checkpoint(stream)
+    }
+
+    fn first_run_at(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Option<Timestamp>, StoreError>> + Send {
+        self.read_first_run_at(stream)
+    }
+
+    fn successes_since(
+        &self,
+        stream: &str,
+        since: Timestamp,
+    ) -> impl Future<Output = Result<Vec<Timestamp>, StoreError>> + Send {
+        self.read_successes_since(stream, since)
+    }
+
+    fn quarantined_count(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<u32, StoreError>> + Send {
+        self.read_quarantined_count(stream)
+    }
+
+    fn last_run(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Option<RunSummary>, StoreError>> + Send {
+        self.read_last_run(stream)
     }
 }
