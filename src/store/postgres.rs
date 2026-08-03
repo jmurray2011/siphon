@@ -20,6 +20,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
 use tokio_postgres::Client;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, warn};
@@ -144,8 +145,18 @@ fn tls_connector() -> Result<MakeRustlsConnect, StoreError> {
 }
 
 /// A mirror held in Postgres.
+///
+/// The client is behind a `Mutex` because `transaction()` needs `&mut`, and
+/// because one connection pipelining concurrent statements cannot also carry an
+/// explicit `BEGIN`/`COMMIT` pair safely. That mirrors what the SQLite target
+/// already does - it serializes every call onto one connection - so neither
+/// target is more concurrent than the other today.
+///
+/// It is also the obvious next thing to fix. A shared cache read by several
+/// consumers wants a connection pool, and swapping this `Mutex` for one is the
+/// change that actually makes Postgres worth having over a file.
 pub struct PgStore {
-    client: Client,
+    client: Mutex<Client>,
 }
 
 impl std::fmt::Debug for PgStore {
@@ -216,7 +227,9 @@ impl PgStore {
             .await?;
         migrated?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client: Mutex::new(client),
+        })
     }
 
     /// How many records are stored for a stream.
@@ -227,6 +240,8 @@ impl PgStore {
     pub async fn record_count(&self, stream: &str) -> Result<u64, StoreError> {
         let row = self
             .client
+            .lock()
+            .await
             .query_one(
                 "SELECT COUNT(*) FROM _siphon_records WHERE stream = $1",
                 &[&stream],
@@ -242,6 +257,8 @@ impl PgStore {
     async fn read_checkpoint(&self, stream: &str) -> Result<Checkpoint, StoreError> {
         let found = self
             .client
+            .lock()
+            .await
             .query_opt(
                 "SELECT cursor_val, page_state, last_run_at, last_success_at, records_seen
                  FROM _siphon_state WHERE stream = $1",
@@ -269,6 +286,8 @@ impl PgStore {
     async fn read_first_run_at(&self, stream: &str) -> Result<Option<Timestamp>, StoreError> {
         let row = self
             .client
+            .lock()
+            .await
             .query_one(
                 "SELECT MIN(started_at) FROM _siphon_runs WHERE stream = $1",
                 &[&stream],
@@ -287,6 +306,8 @@ impl PgStore {
         // current, which is exactly what attainment measures.
         let rows = self
             .client
+            .lock()
+            .await
             .query(
                 "SELECT ended_at FROM _siphon_runs
                  WHERE stream = $1 AND ended_at >= $2
@@ -305,6 +326,8 @@ impl PgStore {
     async fn read_quarantined_count(&self, stream: &str) -> Result<u32, StoreError> {
         let row = self
             .client
+            .lock()
+            .await
             .query_one(
                 "SELECT COUNT(*) FROM _siphon_quarantine WHERE stream = $1",
                 &[&stream],
@@ -318,6 +341,8 @@ impl PgStore {
     async fn read_last_run(&self, stream: &str) -> Result<Option<RunSummary>, StoreError> {
         let found = self
             .client
+            .lock()
+            .await
             .query_opt(
                 "SELECT status, ended_at, error FROM _siphon_runs
                  WHERE stream = $1 AND ended_at IS NOT NULL
@@ -368,5 +393,398 @@ impl ReportStore for PgStore {
         stream: &str,
     ) -> impl Future<Output = Result<Option<RunSummary>, StoreError>> + Send {
         self.read_last_run(stream)
+    }
+}
+
+impl PgStore {
+    /// Upserts a page's records and moves the checkpoint with them, in one
+    /// transaction.
+    ///
+    /// The two halves must commit together. A page whose records land without
+    /// the checkpoint moving is re-fetched and re-counted as new; a checkpoint
+    /// that moves without its records is a silent hole in the mirror. SQLite got
+    /// this for free from a single writer - here it is explicit.
+    async fn write_page_tx(
+        &self,
+        page: super::PageWrite,
+    ) -> Result<super::PageOutcome, StoreError> {
+        let mut guard = self.client.lock().await;
+        let tx = guard.transaction().await?;
+
+        let mut outcome = super::PageOutcome::default();
+        for record in &page.records {
+            let hash = record.payload_hash();
+            let prior = tx
+                .query_opt(
+                    "SELECT hash FROM _siphon_records WHERE stream = $1 AND pk = $2",
+                    &[&page.stream, &record.pk()],
+                )
+                .await?;
+
+            // The read-before-write is what separates a record that was re-seen
+            // from one that genuinely changed, which is the signal the run log
+            // reports and what answers `stop_on_seen_key`.
+            if let Some(row) = prior {
+                outcome.saw_known_key = true;
+                let prior_hash: Vec<u8> = row.get(0);
+                if prior_hash == hash.as_slice() {
+                    outcome.unchanged += 1;
+                    continue;
+                }
+                outcome.changed += 1;
+            } else {
+                outcome.new += 1;
+            }
+
+            tx.execute(
+                "INSERT INTO _siphon_records (stream, pk, payload, hash, cursor_val, fetched_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (stream, pk) DO UPDATE SET
+                   payload    = EXCLUDED.payload,
+                   hash       = EXCLUDED.hash,
+                   cursor_val = EXCLUDED.cursor_val,
+                   fetched_at = EXCLUDED.fetched_at",
+                &[
+                    &page.stream,
+                    &record.pk(),
+                    &record.payload_json(),
+                    &hash.as_slice(),
+                    &record.cursor().map(crate::extract::CursorValue::as_str),
+                    &record.fetched_at().as_millis(),
+                ],
+            )
+            .await?;
+        }
+
+        let written = i64::try_from(page.records.len()).unwrap_or(i64::MAX);
+        match page.progress {
+            super::Progress::Resume(state) => {
+                tx.execute(
+                    "INSERT INTO _siphon_state (stream, page_state, last_run_at, records_seen)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (stream) DO UPDATE SET
+                       page_state   = EXCLUDED.page_state,
+                       last_run_at  = EXCLUDED.last_run_at,
+                       records_seen = _siphon_state.records_seen + EXCLUDED.records_seen",
+                    &[&page.stream, &state, &page.at.as_millis(), &written],
+                )
+                .await?;
+            }
+            super::Progress::Complete {
+                cursor_val,
+                success_at,
+            } => {
+                tx.execute(
+                    "INSERT INTO _siphon_state
+                       (stream, cursor_val, page_state, last_run_at, last_success_at, records_seen)
+                     VALUES ($1, $2, NULL, $3, $4, $5)
+                     ON CONFLICT (stream) DO UPDATE SET
+                       page_state      = NULL,
+                       cursor_val      = COALESCE(EXCLUDED.cursor_val, _siphon_state.cursor_val),
+                       last_run_at     = EXCLUDED.last_run_at,
+                       last_success_at = EXCLUDED.last_success_at,
+                       records_seen    = _siphon_state.records_seen + EXCLUDED.records_seen",
+                    &[
+                        &page.stream,
+                        &cursor_val,
+                        &page.at.as_millis(),
+                        &success_at.as_millis(),
+                        &written,
+                    ],
+                )
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// Clears the resume point and advances the marks a finished walk reached.
+    async fn finish_walk_row(
+        &self,
+        stream: &str,
+        cursor_val: Option<String>,
+        success_at: Option<Timestamp>,
+    ) -> Result<(), StoreError> {
+        let at = success_at.map(Timestamp::as_millis);
+        self.client
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO _siphon_state
+                   (stream, cursor_val, page_state, last_run_at, last_success_at)
+                 VALUES ($1, $2, NULL, $3, $3)
+                 ON CONFLICT (stream) DO UPDATE SET
+                   page_state      = NULL,
+                   cursor_val      = COALESCE(EXCLUDED.cursor_val, _siphon_state.cursor_val),
+                   last_run_at     = COALESCE(EXCLUDED.last_run_at, _siphon_state.last_run_at),
+                   last_success_at = COALESCE(EXCLUDED.last_success_at,
+                                              _siphon_state.last_success_at)",
+                &[&stream, &cursor_val, &at],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Opens a run row. `RETURNING` because Postgres has no `last_insert_rowid`.
+    async fn open_run(
+        &self,
+        stream: &str,
+        started_at: Timestamp,
+        deficit: f64,
+    ) -> Result<i64, StoreError> {
+        let row = self
+            .client
+            .lock()
+            .await
+            .query_one(
+                "INSERT INTO _siphon_runs (stream, started_at, deficit_at_admission)
+                 VALUES ($1, $2, $3) RETURNING id",
+                &[&stream, &started_at.as_millis(), &deficit],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    /// Completes a run row.
+    async fn close_run(&self, run: super::RunRecord) -> Result<(), StoreError> {
+        self.client
+            .lock()
+            .await
+            .execute(
+                "UPDATE _siphon_runs SET
+                   ended_at        = $2,
+                   status          = $3,
+                   pages           = $4,
+                   records         = $5,
+                   records_new     = $6,
+                   records_changed = $7,
+                   not_modified    = $8,
+                   requests        = $9,
+                   stop_reason     = $10,
+                   error           = $11
+                 WHERE id = $1",
+                &[
+                    &run.id,
+                    &run.ended_at.as_millis(),
+                    &run.status.as_str(),
+                    &i64::from(run.pages),
+                    &i64::from(run.records),
+                    &i64::from(run.records_new),
+                    &i64::from(run.records_changed),
+                    &i64::from(run.not_modified),
+                    &i64::from(run.requests),
+                    &run.stop_reason,
+                    &run.error,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The stored validator for a request.
+    async fn read_validator(
+        &self,
+        request_key: &str,
+    ) -> Result<Option<super::Validator>, StoreError> {
+        let found = self
+            .client
+            .lock()
+            .await
+            .query_opt(
+                "SELECT etag, last_modified FROM _siphon_validators WHERE request_key = $1",
+                &[&request_key],
+            )
+            .await?;
+        Ok(found.map(|row| super::Validator {
+            etag: row.get(0),
+            last_modified: row.get(1),
+        }))
+    }
+
+    /// Stores the validator a response carried.
+    async fn write_validator(
+        &self,
+        request_key: &str,
+        validator: super::Validator,
+        at: Timestamp,
+    ) -> Result<(), StoreError> {
+        self.client
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO _siphon_validators (request_key, etag, last_modified, seen_at)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (request_key) DO UPDATE SET
+                   etag          = EXCLUDED.etag,
+                   last_modified = EXCLUDED.last_modified,
+                   seen_at       = EXCLUDED.seen_at",
+                &[
+                    &request_key,
+                    &validator.etag,
+                    &validator.last_modified,
+                    &at.as_millis(),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Sets a page aside, or bumps the attempt count if it is already set aside.
+    async fn write_quarantine(&self, page: super::QuarantinedPage) -> Result<(), StoreError> {
+        let mut excerpt = page.body_excerpt;
+        excerpt.truncate(super::BODY_EXCERPT_LIMIT.min(excerpt.len()));
+        let status = page.status_code.map(i64::from);
+
+        self.client
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO _siphon_quarantine
+                   (stream, page_state, attempts, status_code, body_excerpt, first_seen, last_seen)
+                 VALUES ($1, $2, $3, $4, $5, $6, $6)
+                 ON CONFLICT (stream, page_state) DO UPDATE SET
+                   attempts     = _siphon_quarantine.attempts + EXCLUDED.attempts,
+                   status_code  = EXCLUDED.status_code,
+                   body_excerpt = EXCLUDED.body_excerpt,
+                   last_seen    = EXCLUDED.last_seen",
+                &[
+                    &page.stream,
+                    &page.page_state,
+                    &i64::from(page.attempts),
+                    &status,
+                    &excerpt,
+                    &page.at.as_millis(),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Whether this exact page state is set aside.
+    async fn read_is_quarantined(
+        &self,
+        stream: &str,
+        page_state: &str,
+    ) -> Result<bool, StoreError> {
+        let found = self
+            .client
+            .lock()
+            .await
+            .query_opt(
+                "SELECT 1 FROM _siphon_quarantine WHERE stream = $1 AND page_state = $2",
+                &[&stream, &page_state],
+            )
+            .await?;
+        Ok(found.is_some())
+    }
+
+    /// Whether any of these keys is already stored.
+    ///
+    /// One statement with `= ANY`, rather than the row-at-a-time loop the SQLite
+    /// target uses: there each query is a function call, here each would be a
+    /// network round trip.
+    async fn read_any_known_key(&self, stream: &str, pks: Vec<String>) -> Result<bool, StoreError> {
+        if pks.is_empty() {
+            return Ok(false);
+        }
+        let found = self
+            .client
+            .lock()
+            .await
+            .query_opt(
+                "SELECT 1 FROM _siphon_records WHERE stream = $1 AND pk = ANY($2) LIMIT 1",
+                &[&stream, &pks],
+            )
+            .await?;
+        Ok(found.is_some())
+    }
+}
+
+impl crate::sync::SyncStore for PgStore {
+    fn checkpoint(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Checkpoint, StoreError>> + Send {
+        self.read_checkpoint(stream)
+    }
+
+    fn write_page(
+        &self,
+        page: super::PageWrite,
+    ) -> impl Future<Output = Result<super::PageOutcome, StoreError>> + Send {
+        self.write_page_tx(page)
+    }
+
+    fn finish_walk(
+        &self,
+        stream: &str,
+        cursor_val: Option<String>,
+        success_at: Option<Timestamp>,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        self.finish_walk_row(stream, cursor_val, success_at)
+    }
+
+    fn begin_run(
+        &self,
+        stream: &str,
+        started_at: Timestamp,
+        deficit: f64,
+    ) -> impl Future<Output = Result<i64, StoreError>> + Send {
+        self.open_run(stream, started_at, deficit)
+    }
+
+    fn finish_run(
+        &self,
+        run: super::RunRecord,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        self.close_run(run)
+    }
+
+    fn validator(
+        &self,
+        request_key: &str,
+    ) -> impl Future<Output = Result<Option<super::Validator>, StoreError>> + Send {
+        self.read_validator(request_key)
+    }
+
+    fn save_validator(
+        &self,
+        request_key: &str,
+        validator: super::Validator,
+        at: Timestamp,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        self.write_validator(request_key, validator, at)
+    }
+
+    fn quarantine_page(
+        &self,
+        page: super::QuarantinedPage,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        self.write_quarantine(page)
+    }
+
+    fn is_quarantined(
+        &self,
+        stream: &str,
+        page_state: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        self.read_is_quarantined(stream, page_state)
+    }
+
+    fn quarantined_count(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<u32, StoreError>> + Send {
+        self.read_quarantined_count(stream)
+    }
+
+    fn any_known_key(
+        &self,
+        stream: &str,
+        pks: Vec<String>,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        self.read_any_known_key(stream, pks)
     }
 }
