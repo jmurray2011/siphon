@@ -18,6 +18,34 @@ fn conn_str() -> Option<String> {
     std::env::var("SIPHON_TEST_POSTGRES").ok()
 }
 
+/// A server presenting a certificate the host does not trust, or `None`.
+fn untrusted_tls_conn_str() -> Option<String> {
+    std::env::var("SIPHON_TEST_POSTGRES_UNTRUSTED_TLS").ok()
+}
+
+#[tokio::test]
+async fn an_untrusted_certificate_is_refused_rather_than_accepted() {
+    let Some(conn) = untrusted_tls_conn_str() else {
+        eprintln!("skipped: SIPHON_TEST_POSTGRES_UNTRUSTED_TLS is not set");
+        return;
+    };
+
+    // The server offers TLS with a certificate signed by nobody the host trusts.
+    // Succeeding here would mean verification is switched off somewhere, which
+    // is the failure worth a test: it looks identical to working, and the whole
+    // reason for TLS is the hop to another host.
+    let refused = PgStore::connect(&conn).await;
+    let Err(cause) = refused else {
+        panic!("connected to a server whose certificate should not verify");
+    };
+
+    let text = format!("{cause:?}").to_lowercase();
+    assert!(
+        text.contains("certificate") || text.contains("tls") || text.contains("unknownissuer"),
+        "expected a certificate failure, got: {cause:?}"
+    );
+}
+
 #[tokio::test]
 async fn connecting_applies_the_schema_and_is_repeatable() {
     let Some(conn) = conn_str() else {

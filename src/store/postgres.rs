@@ -17,8 +17,11 @@
 //! | `INTEGER PRIMARY KEY` | `BIGSERIAL PRIMARY KEY` | SQLite aliases the rowid and assigns it; Postgres needs to be told |
 //! | `STRICT` | - | Postgres has no permissive mode to opt out of |
 
-use tokio_postgres::{Client, NoTls};
-use tracing::error;
+use std::sync::Arc;
+
+use tokio_postgres::Client;
+use tokio_postgres_rustls::MakeRustlsConnect;
+use tracing::{error, warn};
 
 use super::StoreError;
 
@@ -98,6 +101,38 @@ CREATE TABLE IF NOT EXISTS _siphon_quarantine (
 );
 ";
 
+/// Builds the TLS connector from the host's trust store.
+///
+/// Pinned to the `ring` provider explicitly rather than relying on a process
+/// default: rustls has no default provider unless one is installed, and leaving
+/// it to whoever calls `install_default` first is a panic waiting for the first
+/// deployment that links things in a different order.
+fn tls_connector() -> Result<MakeRustlsConnect, StoreError> {
+    let mut roots = rustls::RootCertStore::empty();
+    let loaded = rustls_native_certs::load_native_certs();
+
+    // Partial success is normal: a store can hold a certificate this build
+    // cannot parse without that making the rest unusable. An empty result is
+    // not - it means nothing would ever verify.
+    for cause in &loaded.errors {
+        warn!(%cause, "skipping an unreadable root certificate");
+    }
+    let (added, _ignored) = roots.add_parsable_certificates(loaded.certs);
+    if added == 0 {
+        return Err(StoreError::NoRootCertificates);
+    }
+
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| StoreError::NoRootCertificates)?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+
+    Ok(MakeRustlsConnect::new(config))
+}
+
 /// A mirror held in Postgres.
 pub struct PgStore {
     client: Client,
@@ -112,20 +147,35 @@ impl std::fmt::Debug for PgStore {
 }
 
 impl PgStore {
-    /// Connects, applies the schema, and spawns the connection task.
+    /// Connects over TLS, applies the schema, and spawns the connection task.
     ///
-    /// The connection speaks **plaintext**. On loopback or a trusted socket that
-    /// is fine; across a network it is not, and this is the thing to fix before
-    /// the mirror is reachable from another host. Adding TLS means a
-    /// `tokio-postgres-rustls` dependency and a decision about certificate
-    /// verification, neither of which should be guessed at.
+    /// Certificates are verified against the host's own trust store, so a
+    /// private CA works exactly as it does for everything else on the machine
+    /// and nothing here has an option to skip verification.
+    ///
+    /// Whether TLS is *required* is `sslmode` in the connection string, which
+    /// libpq defines and tokio-postgres parses. The default is `prefer`, which
+    /// silently falls back to plaintext when the server declines - fine on
+    /// loopback, wrong across a network, and impossible to notice after the
+    /// fact. Anything weaker than `require` is logged as a warning rather than
+    /// quietly accepted.
     ///
     /// # Errors
     ///
-    /// Fails if the server is unreachable, rejects the credentials, or rejects
-    /// the schema.
+    /// Fails if the trust store cannot be read, the server is unreachable,
+    /// rejects the credentials, or rejects the schema.
     pub async fn connect(conn_str: &str) -> Result<Self, StoreError> {
-        let (client, connection) = tokio_postgres::connect(conn_str, NoTls).await?;
+        if !conn_str.contains("sslmode=require")
+            && !conn_str.contains("sslmode=verify-ca")
+            && !conn_str.contains("sslmode=verify-full")
+        {
+            warn!(
+                "postgres sslmode is weaker than `require`; the connection may \
+                 silently fall back to plaintext"
+            );
+        }
+
+        let (client, connection) = tokio_postgres::connect(conn_str, tls_connector()?).await?;
 
         // `connection` drives the socket and must be polled for the client to
         // work at all. It resolves when the client is dropped, so this task ends

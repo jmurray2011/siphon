@@ -21,6 +21,19 @@ reqwest = { version = "0.12", default-features = false, features = [
 # needs a newer rustc than the 1.92 this is built against. `bundled` is what
 # makes the single-binary promise hold - no libsqlite3 on the host.
 rusqlite = { version = "0.37", features = ["bundled"] }
+# Pinned to the `ring` provider. rustls defaults to `aws-lc-rs`, which needs a C
+# toolchain and would break the static musl build and the no-C-dependency rule.
+# reqwest already builds rustls with ring, so this shares one stack rather than
+# linking two.
+rustls = { version = "0.23.43", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+# Root certificates come from the OS trust store rather than a bundled copy, so
+# a private CA is trusted the same way everything else on the host trusts it.
+rustls-native-certs = "0.8.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # RFC 9535 compliant, unlike the older ad-hoc jsonpath crates.
@@ -38,11 +51,11 @@ tokio = { version = "1", features = [
     "signal",
 ] }
 # `runtime` is what provides `connect()`; without it only a pre-made stream can
-# be used. No TLS feature: this speaks plaintext, which is fine on loopback and
-# is not fine across a network - see `postgres::PgStore::connect`.
+# be used. TLS comes from tokio-postgres-rustls rather than a feature here.
 tokio-postgres = { version = "0.7.18", default-features = false, features = [
     "runtime",
 ] }
+tokio-postgres-rustls = "0.14.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"

@@ -34,6 +34,12 @@ pub enum StoreError {
     /// The Postgres server rejected a statement, or could not be reached.
     #[error("postgres error")]
     Postgres(#[from] tokio_postgres::Error),
+    /// The host trust store yielded no usable root certificates.
+    ///
+    /// Separate from a connection failure because the fix is different: nothing
+    /// would ever verify, so this is a broken host rather than a broken server.
+    #[error("no usable root certificates in the host trust store")]
+    NoRootCertificates,
     /// The database directory could not be created.
     #[error("cannot create database directory `{path}`")]
     Directory {
