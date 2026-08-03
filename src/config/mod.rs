@@ -50,10 +50,34 @@ pub struct Config {
 }
 
 /// Where the mirror is written.
+///
+/// An enum rather than a struct with optional fields: the two targets need
+/// disjoint information, and the choice is made once at startup from a config
+/// file, which is exactly what an enum models.
 #[derive(Debug, Clone)]
-pub struct StoreSpec {
-    /// Path to the SQLite file.
-    pub path: PathBuf,
+pub enum StoreSpec {
+    /// A local SQLite file.
+    Sqlite {
+        /// Path to the database file.
+        path: PathBuf,
+    },
+    /// A Postgres server.
+    Postgres {
+        /// How to reach it. Resolved at connect time, not here.
+        url: secret::SecretRef,
+    },
+}
+
+impl StoreSpec {
+    /// A description safe to log: a Postgres connection string can carry a
+    /// password, so only its origin is ever printed.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Sqlite { path } => path.display().to_string(),
+            Self::Postgres { url } => format!("postgres ({})", url.origin()),
+        }
+    }
 }
 
 /// One API, with everything needed to talk to it.
@@ -221,6 +245,12 @@ impl RequestSpec {
 /// Why a config was rejected.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// The `store` block does not match the backend it names.
+    #[error("store: {message}")]
+    Store {
+        /// What is wrong with it.
+        message: String,
+    },
     /// The file could not be read.
     #[error("cannot read config `{path}`")]
     Read {
@@ -404,9 +434,7 @@ impl Config {
         }
 
         Ok(Self {
-            store: StoreSpec {
-                path: raw.store.path,
-            },
+            store: build_store(raw.store)?,
             sources,
             streams,
         })
@@ -433,6 +461,17 @@ impl Config {
     #[must_use]
     pub fn lint(&self) -> Vec<Lint> {
         let mut lints = Vec::new();
+
+        // A libpq connection string carries a password, so an inline one is the
+        // same finding as an inline credential.
+        if let StoreSpec::Postgres { url } = &self.store {
+            if url.is_inline() {
+                lints.push(Lint {
+                    subject: "store.url".to_owned(),
+                    message: "connection string is written into the config file; use `${ENV_VAR}` or `file:/path` instead".to_owned(),
+                });
+            }
+        }
 
         for (name, source) in &self.sources {
             for secret in source.auth.secrets() {
@@ -594,6 +633,39 @@ fn build_retry(raw: Option<&RawRetry>) -> RetryPolicy {
 /// the URL has to parse for the config to validate at all. The cost is that
 /// `siphon validate` needs the variable set; run it under whatever supplies the
 /// rest of the environment.
+/// Checks the `store` block against the backend it names.
+///
+/// The wrong-key cases are refused rather than ignored: a `path` under
+/// `type: postgres` almost always means the author edited `type` and forgot the
+/// rest, and silently honouring one key while dropping the other is how a
+/// mirror ends up somewhere nobody looks.
+fn build_store(raw: raw::RawStore) -> Result<StoreSpec, ConfigError> {
+    match raw.kind {
+        raw::StoreKind::Sqlite => {
+            if raw.url.is_some() {
+                return Err(ConfigError::Store {
+                    message: "`url` is a postgres setting; a sqlite store takes `path`".to_owned(),
+                });
+            }
+            let path = raw.path.ok_or_else(|| ConfigError::Store {
+                message: "a sqlite store needs `path`".to_owned(),
+            })?;
+            Ok(StoreSpec::Sqlite { path })
+        }
+        raw::StoreKind::Postgres => {
+            if raw.path.is_some() {
+                return Err(ConfigError::Store {
+                    message: "`path` is a sqlite setting; a postgres store takes `url`".to_owned(),
+                });
+            }
+            let url = raw.url.ok_or_else(|| ConfigError::Store {
+                message: "a postgres store needs `url`".to_owned(),
+            })?;
+            Ok(StoreSpec::Postgres { url })
+        }
+    }
+}
+
 fn resolve_base_url(source_name: &str, declared: &str) -> Result<String, ConfigError> {
     let Some(variable) = declared
         .strip_prefix("${")
@@ -849,7 +921,9 @@ streams:
     #[test]
     fn parses_the_worked_example() {
         let config = parse(MINIMAL);
-        assert_eq!(config.store.path, PathBuf::from("./data/mirror.db"));
+        assert!(
+            matches!(&config.store, StoreSpec::Sqlite { path } if path == &PathBuf::from("./data/mirror.db"))
+        );
         assert_eq!(config.sources.len(), 1);
         assert_eq!(config.streams.len(), 1);
 
@@ -1262,5 +1336,60 @@ streams:
     fn missing_file_reports_the_path() {
         let err = Config::load("/nonexistent/siphon.yaml").unwrap_err();
         assert!(matches!(err, ConfigError::Read { .. }));
+    }
+
+    /// A minimal config with the given `store` block and one valid stream.
+    fn with_store(store: &str) -> String {
+        format!(
+            "version: 1\n{store}\nsources:\n  api:\n    base_url: https://api.example.com\n\
+             streams:\n  - name: items\n    source: api\n    freshness: 15m\n    request:\n\
+             \x20     path: /items\n    pagination:\n      strategy: none\n    records:\n\
+             \x20     path: $.items\n      primary_key: $.id\n"
+        )
+    }
+
+    #[test]
+    fn a_postgres_store_is_selectable_from_the_config() {
+        let config = Config::parse(&with_store(
+            "store:\n  type: postgres\n  url: ${DATABASE_URL}",
+        ))
+        .expect("config is valid");
+        assert!(matches!(&config.store, StoreSpec::Postgres { .. }));
+    }
+
+    #[test]
+    fn a_path_under_a_postgres_store_is_refused_rather_than_ignored() {
+        // The likely cause is an author who changed `type` and left the rest
+        // behind. Honouring the `type` and silently dropping the path would
+        // point the mirror somewhere nobody is looking.
+        let err = Config::parse(&with_store(
+            "store:\n  type: postgres\n  path: ./data/mirror.db",
+        ))
+        .expect_err("a postgres store has no path");
+        assert!(matches!(err, ConfigError::Store { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_url_under_a_sqlite_store_is_refused_rather_than_ignored() {
+        let err = Config::parse(&with_store(
+            "store:\n  type: sqlite\n  url: postgres://localhost/siphon",
+        ))
+        .expect_err("a sqlite store has no url");
+        assert!(matches!(err, ConfigError::Store { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn an_inline_connection_string_is_reported_as_a_finding() {
+        // It carries a password, so it earns the same finding as an inline
+        // credential rather than loading silently.
+        let config = Config::parse(&with_store(
+            "store:\n  type: postgres\n  url: postgres://siphon:hunter2@localhost/siphon",
+        ))
+        .expect("an inline url still loads");
+        let lints = config.lint();
+        assert!(
+            lints.iter().any(|lint| lint.subject == "store.url"),
+            "expected a store.url finding, got {lints:?}"
+        );
     }
 }

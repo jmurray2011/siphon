@@ -39,23 +39,39 @@ pub struct RawConfig {
 }
 
 /// The `store` block.
+///
+/// `path` and `url` are both optional here and checked against `type` when the
+/// config is built: a path means nothing to Postgres and a connection string
+/// means nothing to SQLite, so accepting either for either would let a typo
+/// pass validation and surface as a mirror written somewhere unexpected.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawStore {
-    /// Which store backend. Only `sqlite` in v0.1.
+    /// Which store backend.
     #[serde(rename = "type", default)]
     pub kind: StoreKind,
-    /// Path to the database file.
-    pub path: PathBuf,
+    /// Path to the database file. Required by `sqlite`, refused by `postgres`.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// Connection string. Required by `postgres`, refused by `sqlite`.
+    ///
+    /// A `SecretRef` because a libpq connection string carries a password;
+    /// writing one into a config file earns the same `validate` finding as an
+    /// inline credential.
+    #[serde(default)]
+    pub url: Option<SecretRef>,
 }
 
 /// Store backends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreKind {
-    /// A local SQLite file.
+    /// A local SQLite file. The right default: no server to run, and the
+    /// single-owner case is the common one.
     #[default]
     Sqlite,
+    /// A Postgres server, for a mirror several projects read.
+    Postgres,
 }
 
 /// The `defaults` block.

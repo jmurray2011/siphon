@@ -137,8 +137,11 @@ sqlite3 data/mirror.db \
   "SELECT json_extract(payload, '$.title') FROM _siphon_records WHERE stream='issues' LIMIT 5"
 ```
 
-siphon deliberately does not serve a read API. The output is a SQLite file; point
-Datasette, your own app, or `sqlite3` at it.
+siphon deliberately does not serve a read API. The output is a SQLite file or a
+Postgres schema; point Datasette, PostgREST, `psql`, `sqlite3`, or your own app
+at it. That is also how several projects share one mirror - a database wire
+protocol every language already speaks, rather than an HTTP surface siphon would
+have to design, version and keep up.
 
 ## Commands
 
@@ -372,6 +375,43 @@ paginator advances by another, so every page skips or repeats records.
 ## Storage
 
 Everything siphon owns is prefixed `_siphon_`; the rest of the database is yours.
+
+Two targets, chosen by `store.type`. They hold the same tables; what differs is
+who can reach them.
+
+```yaml
+store:
+  type: sqlite            # the default
+  path: ./data/mirror.db
+```
+
+```yaml
+store:
+  type: postgres
+  url: ${DATABASE_URL}    # libpq connection string
+```
+
+SQLite is right when one project owns the mirror and reads it from the same box:
+no server, no ceremony. Postgres is for a mirror several projects read, or a
+daemon that does not run on the same host as its readers - a file is reachable
+from exactly one filesystem and tolerates exactly one writer.
+
+The two keys are not interchangeable: a `path` under `type: postgres` is refused
+rather than ignored, because the likely cause is an author who changed `type`
+and left the rest behind, and silently honouring one key would put the mirror
+somewhere nobody is looking.
+
+`url` is read as a secret reference, so `${ENV_VAR}` and `file:/path` both work
+and a connection string written into the config earns a `validate` finding - it
+carries a password. TLS is verified against the host's trust store, so a private
+CA works the way everything else on the machine trusts it. Set `sslmode=require`
+or stronger in the connection string when the server is not on loopback:
+libpq's default is `prefer`, which silently falls back to plaintext, and siphon
+warns when it sees anything weaker.
+
+`siphon test` always uses a throwaway in-memory SQLite store regardless of
+`store.type`. It writes nothing, so a probe should not need the server to be
+reachable.
 
 | Table | What is in it |
 |---|---|

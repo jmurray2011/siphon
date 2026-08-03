@@ -1335,3 +1335,245 @@ mod tests {
         assert!(matches!(err, StoreError::SchemaTooNew { .. }));
     }
 }
+
+/// The mirror, whichever target holds it.
+///
+/// The store target is chosen once at startup from a config file, so it is a
+/// runtime value rather than a type parameter: making `App` generic would push
+/// `S` through every command signature for a choice that is made exactly once
+/// and never varies within a process.
+#[derive(Debug, Clone)]
+pub enum Mirror {
+    /// A local SQLite file.
+    Sqlite(Store),
+    /// A Postgres server.
+    ///
+    /// Behind an `Arc` so `Mirror` stays cheap to clone the way `Store` is:
+    /// `PgStore` owns a connection behind a `Mutex` and cannot be duplicated,
+    /// and the worker takes its store by value.
+    Postgres(Arc<postgres::PgStore>),
+}
+
+impl Mirror {
+    /// Every stored checkpoint, keyed by stream.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the query does.
+    pub async fn checkpoints(&self) -> Result<BTreeMap<String, Checkpoint>, StoreError> {
+        match self {
+            Self::Sqlite(store) => store.checkpoints().await,
+            Self::Postgres(store) => store.checkpoints().await,
+        }
+    }
+
+    /// The checkpoint for one stream, or a blank one if it has never run.
+    ///
+    /// Inherent rather than only a trait method so callers that hold a concrete
+    /// `Mirror` do not have to disambiguate between the two traits that both
+    /// declare it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the query does.
+    pub async fn checkpoint(&self, stream: &str) -> Result<Checkpoint, StoreError> {
+        crate::sync::SyncStore::checkpoint(self, stream).await
+    }
+
+    /// How many pages of this stream are quarantined.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the query does.
+    pub async fn quarantined_count(&self, stream: &str) -> Result<u32, StoreError> {
+        crate::sync::SyncStore::quarantined_count(self, stream).await
+    }
+
+    /// How many records are stored for a stream.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the query does.
+    pub async fn record_count(&self, stream: &str) -> Result<u64, StoreError> {
+        match self {
+            Self::Sqlite(store) => store.record_count(stream).await,
+            Self::Postgres(store) => store.record_count(stream).await,
+        }
+    }
+
+    /// The learned budget for a source, if one was ever persisted.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the query does.
+    pub async fn load_budget(&self, source: &str) -> Result<Option<BudgetSnapshot>, StoreError> {
+        match self {
+            Self::Sqlite(store) => store.load_budget(source).await,
+            Self::Postgres(store) => store.load_budget(source).await,
+        }
+    }
+
+    /// Persists the learned budget for a source.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the upsert does.
+    pub async fn save_budget(
+        &self,
+        source: &str,
+        snapshot: BudgetSnapshot,
+        at: Timestamp,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(store) => store.save_budget(source, snapshot, at).await,
+            Self::Postgres(store) => store.save_budget(source, snapshot, at).await,
+        }
+    }
+}
+
+impl crate::sync::SyncStore for Mirror {
+    async fn checkpoint(&self, stream: &str) -> Result<Checkpoint, StoreError> {
+        match self {
+            Self::Sqlite(s) => crate::sync::SyncStore::checkpoint(s, stream).await,
+            Self::Postgres(s) => crate::sync::SyncStore::checkpoint(&**s, stream).await,
+        }
+    }
+
+    async fn write_page(&self, page: PageWrite) -> Result<PageOutcome, StoreError> {
+        match self {
+            Self::Sqlite(s) => crate::sync::SyncStore::write_page(s, page).await,
+            Self::Postgres(s) => crate::sync::SyncStore::write_page(&**s, page).await,
+        }
+    }
+
+    async fn finish_walk(
+        &self,
+        stream: &str,
+        cursor_val: Option<String>,
+        success_at: Option<Timestamp>,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(s) => {
+                crate::sync::SyncStore::finish_walk(s, stream, cursor_val, success_at).await
+            }
+            Self::Postgres(s) => {
+                crate::sync::SyncStore::finish_walk(&**s, stream, cursor_val, success_at).await
+            }
+        }
+    }
+
+    async fn begin_run(
+        &self,
+        stream: &str,
+        started_at: Timestamp,
+        deficit: f64,
+    ) -> Result<i64, StoreError> {
+        match self {
+            Self::Sqlite(s) => {
+                crate::sync::SyncStore::begin_run(s, stream, started_at, deficit).await
+            }
+            Self::Postgres(s) => {
+                crate::sync::SyncStore::begin_run(&**s, stream, started_at, deficit).await
+            }
+        }
+    }
+
+    async fn finish_run(&self, run: RunRecord) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(s) => crate::sync::SyncStore::finish_run(s, run).await,
+            Self::Postgres(s) => crate::sync::SyncStore::finish_run(&**s, run).await,
+        }
+    }
+
+    async fn validator(&self, request_key: &str) -> Result<Option<Validator>, StoreError> {
+        match self {
+            Self::Sqlite(s) => crate::sync::SyncStore::validator(s, request_key).await,
+            Self::Postgres(s) => crate::sync::SyncStore::validator(&**s, request_key).await,
+        }
+    }
+
+    async fn save_validator(
+        &self,
+        request_key: &str,
+        validator: Validator,
+        at: Timestamp,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(s) => {
+                crate::sync::SyncStore::save_validator(s, request_key, validator, at).await
+            }
+            Self::Postgres(s) => {
+                crate::sync::SyncStore::save_validator(&**s, request_key, validator, at).await
+            }
+        }
+    }
+
+    async fn quarantine_page(&self, page: QuarantinedPage) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(s) => crate::sync::SyncStore::quarantine_page(s, page).await,
+            Self::Postgres(s) => crate::sync::SyncStore::quarantine_page(&**s, page).await,
+        }
+    }
+
+    async fn is_quarantined(&self, stream: &str, page_state: &str) -> Result<bool, StoreError> {
+        match self {
+            Self::Sqlite(s) => crate::sync::SyncStore::is_quarantined(s, stream, page_state).await,
+            Self::Postgres(s) => {
+                crate::sync::SyncStore::is_quarantined(&**s, stream, page_state).await
+            }
+        }
+    }
+
+    async fn quarantined_count(&self, stream: &str) -> Result<u32, StoreError> {
+        match self {
+            Self::Sqlite(s) => crate::sync::SyncStore::quarantined_count(s, stream).await,
+            Self::Postgres(s) => crate::sync::SyncStore::quarantined_count(&**s, stream).await,
+        }
+    }
+
+    async fn any_known_key(&self, stream: &str, pks: Vec<String>) -> Result<bool, StoreError> {
+        match self {
+            Self::Sqlite(s) => crate::sync::SyncStore::any_known_key(s, stream, pks).await,
+            Self::Postgres(s) => crate::sync::SyncStore::any_known_key(&**s, stream, pks).await,
+        }
+    }
+}
+
+impl crate::cli::status::ReportStore for Mirror {
+    async fn checkpoint(&self, stream: &str) -> Result<Checkpoint, StoreError> {
+        crate::sync::SyncStore::checkpoint(self, stream).await
+    }
+
+    async fn first_run_at(&self, stream: &str) -> Result<Option<Timestamp>, StoreError> {
+        match self {
+            Self::Sqlite(s) => crate::cli::status::ReportStore::first_run_at(s, stream).await,
+            Self::Postgres(s) => crate::cli::status::ReportStore::first_run_at(&**s, stream).await,
+        }
+    }
+
+    async fn successes_since(
+        &self,
+        stream: &str,
+        since: Timestamp,
+    ) -> Result<Vec<Timestamp>, StoreError> {
+        match self {
+            Self::Sqlite(s) => {
+                crate::cli::status::ReportStore::successes_since(s, stream, since).await
+            }
+            Self::Postgres(s) => {
+                crate::cli::status::ReportStore::successes_since(&**s, stream, since).await
+            }
+        }
+    }
+
+    async fn quarantined_count(&self, stream: &str) -> Result<u32, StoreError> {
+        crate::sync::SyncStore::quarantined_count(self, stream).await
+    }
+
+    async fn last_run(&self, stream: &str) -> Result<Option<RunSummary>, StoreError> {
+        match self {
+            Self::Sqlite(s) => crate::cli::status::ReportStore::last_run(s, stream).await,
+            Self::Postgres(s) => crate::cli::status::ReportStore::last_run(&**s, stream).await,
+        }
+    }
+}

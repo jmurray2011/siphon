@@ -13,9 +13,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::budget::Budget;
 use crate::clock::{Clock, SystemClock};
 use crate::config::Config;
+use crate::config::StoreSpec;
 use crate::governor::{AdmissionPolicy, Governor, StreamState};
 use crate::http::SourceClient;
-use crate::store::Store;
+use crate::store::postgres::PgStore;
+use crate::store::{Mirror, Store};
 use crate::sync::{RunOptions, SyncWorker};
 
 /// The default config path when none is given.
@@ -137,11 +139,11 @@ pub struct App {
     /// The validated config.
     pub config: Config,
     /// The mirror.
-    pub store: Store,
+    pub store: Mirror,
     /// Admission and pacing.
     pub governor: Arc<Governor>,
     /// The stream driver.
-    pub worker: Arc<SyncWorker<Store>>,
+    pub worker: Arc<SyncWorker<Mirror>>,
     /// The clock everything reads time from.
     pub clock: Arc<dyn Clock>,
 }
@@ -164,10 +166,25 @@ impl App {
             tracing::warn!(subject = %lint.subject, "{}", lint.message);
         }
 
-        let store = match storage {
-            Storage::OnDisk => Store::open(&config.store.path)
-                .with_context(|| format!("opening store at {}", config.store.path.display()))?,
-            Storage::Ephemeral => Store::open_in_memory().context("opening in-memory store")?,
+        // `siphon test` always uses a throwaway in-memory SQLite store: it
+        // writes nothing, so pointing it at the real Postgres mirror would mean
+        // a probe could not be run without reaching the server.
+        let store = match (storage, &config.store) {
+            (Storage::Ephemeral, _) => {
+                Mirror::Sqlite(Store::open_in_memory().context("opening in-memory store")?)
+            }
+            (Storage::OnDisk, StoreSpec::Sqlite { path }) => Mirror::Sqlite(
+                Store::open(path)
+                    .with_context(|| format!("opening store at {}", path.display()))?,
+            ),
+            (Storage::OnDisk, StoreSpec::Postgres { url }) => {
+                let conn_str = url.resolve().context("resolving the postgres url")?;
+                Mirror::Postgres(Arc::new(
+                    PgStore::connect(conn_str.expose())
+                        .await
+                        .context("connecting to postgres")?,
+                ))
+            }
         };
 
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);

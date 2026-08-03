@@ -33,7 +33,7 @@ pub async fn daemon(app: App) -> anyhow::Result<()> {
     info!(
         streams = stream_count,
         sources = app.config.sources.len(),
-        store = %app.config.store.path.display(),
+        store = %app.config.store.describe(),
         "siphon starting"
     );
     if stream_count == 0 {
