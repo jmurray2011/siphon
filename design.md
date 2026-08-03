@@ -566,6 +566,12 @@ Storage trait; Postgres target; typed projection with drift handling. These thre
 
 The reorder has a cost worth stating: it puts a second store target in front of `siphon infer` and the change-rate advisory, which are the features that make the tool pleasant for a single user. That is the right trade only while the shared-cache case is real. If it stops being real, this ordering should go back.
 
+*Status: the first two shipped.* The storage layer is two consumer-named traits - `SyncStore` (the write path) and `ReportStore` (what `status` reads) - with SQLite and Postgres implementations behind a `Mirror` enum selected by `store.type`. The typed projection has not been built.
+
+Extracting the traits after v0.1 rather than before cost about what open question 9 predicted, and the bill came due in a specific place: `CREATE TABLE IF NOT EXISTS` is not race-safe in Postgres, so two processes starting together both pass the existence check and one fails. SQLite had never shown it, because a single embedded connection has no one to race. That is the shape of the whole exercise - the second implementation is what tests the trait, and the failures it finds are the ones a single-writer store lets you not think about.
+
+What is still single-writer is the Postgres client itself: one connection behind a `Mutex`, because `transaction()` needs `&mut`. So the target currently buys *reachability*, not *concurrency*. A connection pool is what makes it better than a file rather than merely further away, and it is the next thing in this milestone.
+
 **v0.2a — usability**
 `siphon infer`; `status --advise` change-rate advisory; `next_url` strategy; `schema` / `reproject` / `budget` / `quarantine` commands; full retry classification; dead-letter table.
 
