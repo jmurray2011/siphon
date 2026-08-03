@@ -141,7 +141,7 @@ pub struct App {
     /// Admission and pacing.
     pub governor: Arc<Governor>,
     /// The stream driver.
-    pub worker: Arc<SyncWorker>,
+    pub worker: Arc<SyncWorker<Store>>,
     /// The clock everything reads time from.
     pub clock: Arc<dyn Clock>,
 }

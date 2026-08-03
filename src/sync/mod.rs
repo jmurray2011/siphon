@@ -6,6 +6,7 @@
 //! because at that point nothing can proceed.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +18,10 @@ use crate::extract::{CursorValue, Record};
 use crate::governor::Governor;
 use crate::http::{HttpError, Response, ResponseClass, SourceClient};
 use crate::pagination::{Advance, PageOutcome, PageState, StopReason};
-use crate::store::{PageWrite, Progress, QuarantinedPage, RunRecord, RunStatus, Store, StoreError};
+use crate::store::{
+    Checkpoint, PageWrite, Progress, QuarantinedPage, RunRecord, RunStatus, Store, StoreError,
+    Validator,
+};
 
 /// How many times one page will re-wait on a rate limit before the run gives up.
 ///
@@ -125,19 +129,188 @@ pub struct ProbeReport {
     pub error: Option<String>,
 }
 
+/// What driving a stream needs from a store.
+///
+/// This is the write path, and it is where the two store targets actually
+/// differ. `write_page` and `finish_walk` are one logical transaction - records
+/// landed and the checkpoint moved - and SQLite has let that stay implicit,
+/// because a single embedded connection has no one to race. Postgres will not,
+/// so the boundary is named here rather than discovered later.
+///
+/// Methods return `impl Future + Send` rather than being `async fn` for the
+/// reason given on `ReportStore`: a bare `async fn` in a public trait yields a
+/// future the caller cannot bound as `Send`, and these run under spawned tasks.
+pub trait SyncStore {
+    /// Where the last walk of this stream got to.
+    fn checkpoint(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Checkpoint, StoreError>> + Send;
+
+    /// Writes one page of records and advances the checkpoint with it.
+    fn write_page(
+        &self,
+        page: PageWrite,
+    ) -> impl Future<Output = Result<crate::store::PageOutcome, StoreError>> + Send;
+
+    /// Closes out a walk, storing the high-water mark it reached.
+    fn finish_walk(
+        &self,
+        stream: &str,
+        cursor_val: Option<String>,
+        success_at: Option<Timestamp>,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Opens a run row and returns its id.
+    fn begin_run(
+        &self,
+        stream: &str,
+        started_at: Timestamp,
+        deficit: f64,
+    ) -> impl Future<Output = Result<i64, StoreError>> + Send;
+
+    /// Completes a run row.
+    fn finish_run(&self, run: RunRecord) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// The stored `ETag`/`Last-Modified` for a request, if any.
+    fn validator(
+        &self,
+        request_key: &str,
+    ) -> impl Future<Output = Result<Option<Validator>, StoreError>> + Send;
+
+    /// Stores the validator a response carried.
+    fn save_validator(
+        &self,
+        request_key: &str,
+        validator: Validator,
+        at: Timestamp,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Records a page that failed fatally often enough to be set aside.
+    fn quarantine_page(
+        &self,
+        page: QuarantinedPage,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Whether this exact page state is quarantined.
+    fn is_quarantined(
+        &self,
+        stream: &str,
+        page_state: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// How many pages of this stream are quarantined.
+    fn quarantined_count(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<u32, StoreError>> + Send;
+
+    /// Whether any of these primary keys is already stored, which is how a
+    /// `stop_on_seen_key` walk knows it has caught up.
+    fn any_known_key(
+        &self,
+        stream: &str,
+        pks: Vec<String>,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+}
+
+impl SyncStore for Store {
+    fn checkpoint(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<Checkpoint, StoreError>> + Send {
+        Self::checkpoint(self, stream)
+    }
+
+    fn write_page(
+        &self,
+        page: PageWrite,
+    ) -> impl Future<Output = Result<crate::store::PageOutcome, StoreError>> + Send {
+        Self::write_page(self, page)
+    }
+
+    fn finish_walk(
+        &self,
+        stream: &str,
+        cursor_val: Option<String>,
+        success_at: Option<Timestamp>,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        Self::finish_walk(self, stream, cursor_val, success_at)
+    }
+
+    fn begin_run(
+        &self,
+        stream: &str,
+        started_at: Timestamp,
+        deficit: f64,
+    ) -> impl Future<Output = Result<i64, StoreError>> + Send {
+        Self::begin_run(self, stream, started_at, deficit)
+    }
+
+    fn finish_run(&self, run: RunRecord) -> impl Future<Output = Result<(), StoreError>> + Send {
+        Self::finish_run(self, run)
+    }
+
+    fn validator(
+        &self,
+        request_key: &str,
+    ) -> impl Future<Output = Result<Option<Validator>, StoreError>> + Send {
+        Self::validator(self, request_key)
+    }
+
+    fn save_validator(
+        &self,
+        request_key: &str,
+        validator: Validator,
+        at: Timestamp,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        Self::save_validator(self, request_key, validator, at)
+    }
+
+    fn quarantine_page(
+        &self,
+        page: QuarantinedPage,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        Self::quarantine_page(self, page)
+    }
+
+    fn is_quarantined(
+        &self,
+        stream: &str,
+        page_state: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        Self::is_quarantined(self, stream, page_state)
+    }
+
+    fn quarantined_count(
+        &self,
+        stream: &str,
+    ) -> impl Future<Output = Result<u32, StoreError>> + Send {
+        Self::quarantined_count(self, stream)
+    }
+
+    fn any_known_key(
+        &self,
+        stream: &str,
+        pks: Vec<String>,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        Self::any_known_key(self, stream, pks)
+    }
+}
+
 /// Drives streams against their sources.
-pub struct SyncWorker {
-    store: Store,
+pub struct SyncWorker<S> {
+    store: S,
     governor: Arc<Governor>,
     clock: Arc<dyn Clock>,
     clients: BTreeMap<String, Arc<SourceClient>>,
 }
 
-impl SyncWorker {
+impl<S: SyncStore> SyncWorker<S> {
     /// Builds a worker over the given source clients.
     #[must_use]
     pub fn new(
-        store: Store,
+        store: S,
         governor: Arc<Governor>,
         clock: Arc<dyn Clock>,
         clients: BTreeMap<String, Arc<SourceClient>>,
