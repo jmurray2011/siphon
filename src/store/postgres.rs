@@ -17,6 +17,7 @@
 //! | `INTEGER PRIMARY KEY` | `BIGSERIAL PRIMARY KEY` | SQLite aliases the rowid and assigns it; Postgres needs to be told |
 //! | `STRICT` | - | Postgres has no permissive mode to opt out of |
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -25,7 +26,7 @@ use tokio_postgres::Client;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, warn};
 
-use super::{Checkpoint, RunSummary, StoreError};
+use super::{BudgetSnapshot, Checkpoint, RunSummary, StoreError};
 use crate::cli::status::ReportStore;
 use crate::clock::Timestamp;
 
@@ -786,5 +787,108 @@ impl crate::sync::SyncStore for PgStore {
         pks: Vec<String>,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send {
         self.read_any_known_key(stream, pks)
+    }
+}
+
+impl PgStore {
+    /// Every stored checkpoint, keyed by stream.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the query does.
+    pub async fn checkpoints(&self) -> Result<BTreeMap<String, Checkpoint>, StoreError> {
+        let rows = self
+            .client
+            .lock()
+            .await
+            .query(
+                "SELECT stream, cursor_val, page_state, last_run_at, last_success_at, records_seen
+                 FROM _siphon_state",
+                &[],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let records_seen: i64 = row.get(5);
+                (
+                    row.get::<_, String>(0),
+                    Checkpoint {
+                        cursor_val: row.get(1),
+                        page_state: row.get(2),
+                        last_run_at: row.get::<_, Option<i64>>(3).map(Timestamp::from_millis),
+                        last_success_at: row.get::<_, Option<i64>>(4).map(Timestamp::from_millis),
+                        records_seen: records_seen.max(0).unsigned_abs(),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// The learned budget for a source, if one was ever persisted.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the query does.
+    pub async fn load_budget(&self, source: &str) -> Result<Option<BudgetSnapshot>, StoreError> {
+        let found = self
+            .client
+            .lock()
+            .await
+            .query_opt(
+                "SELECT observed_limit, window_secs, remaining, reset_at, ratcheted_at
+                 FROM _siphon_budget WHERE source = $1",
+                &[&source],
+            )
+            .await?;
+
+        Ok(found.map(|row| BudgetSnapshot {
+            observed_limit: row.get::<_, Option<i64>>(0).map(super::u64_of),
+            window_secs: row.get::<_, Option<i64>>(1).map(super::u64_of),
+            remaining: row.get::<_, Option<i64>>(2).map(super::u64_of),
+            reset_at: row.get::<_, Option<i64>>(3).map(Timestamp::from_millis),
+            ratcheted_at: row.get::<_, Option<i64>>(4).map(Timestamp::from_millis),
+        }))
+    }
+
+    /// Persists the learned budget for a source.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the upsert does.
+    pub async fn save_budget(
+        &self,
+        source: &str,
+        snapshot: BudgetSnapshot,
+        at: Timestamp,
+    ) -> Result<(), StoreError> {
+        self.client
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO _siphon_budget
+                   (source, observed_limit, window_secs, remaining, reset_at, ratcheted_at,
+                    updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (source) DO UPDATE SET
+                   observed_limit = EXCLUDED.observed_limit,
+                   window_secs    = EXCLUDED.window_secs,
+                   remaining      = EXCLUDED.remaining,
+                   reset_at       = EXCLUDED.reset_at,
+                   ratcheted_at   = EXCLUDED.ratcheted_at,
+                   updated_at     = EXCLUDED.updated_at",
+                &[
+                    &source,
+                    &snapshot.observed_limit.map(super::i64_of),
+                    &snapshot.window_secs.map(super::i64_of),
+                    &snapshot.remaining.map(super::i64_of),
+                    &snapshot.reset_at.map(Timestamp::as_millis),
+                    &snapshot.ratcheted_at.map(Timestamp::as_millis),
+                    &at.as_millis(),
+                ],
+            )
+            .await?;
+        Ok(())
     }
 }
