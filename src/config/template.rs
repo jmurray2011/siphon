@@ -155,7 +155,10 @@ mod tests {
 
         // The second pass resolves what the first one left.
         let resolved = render(&rendered, &vars(&[("cursor", "2021-05-04 22:10")])).unwrap();
-        assert_eq!(resolved, "project = ABC AND updated >= \"2021-05-04 22:10\"");
+        assert_eq!(
+            resolved,
+            "project = ABC AND updated >= \"2021-05-04 22:10\""
+        );
     }
 
     #[test]
