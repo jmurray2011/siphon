@@ -3,7 +3,7 @@ name = "siphon"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Config-driven daemon that mirrors HTTP APIs into SQLite, scheduling polls against a measured rate-limit budget"
+description = "Config-driven daemon that mirrors HTTP APIs into SQLite or Postgres, scheduling polls against a measured rate-limit budget"
 license = "MIT OR Apache-2.0"
 publish = false
 
