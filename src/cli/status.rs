@@ -166,6 +166,7 @@ pub async fn report(app: &App) -> anyhow::Result<()> {
             stream.freshness,
             lag,
             read.quarantined,
+            read.ran,
             read.last_status.as_deref(),
         );
 
@@ -197,6 +198,7 @@ struct StreamRead {
     last_ok: Option<Timestamp>,
     attain: Option<String>,
     quarantined: u32,
+    ran: bool,
     last_status: Option<String>,
 }
 
@@ -210,13 +212,15 @@ async fn read_stream(
 ) -> Result<StreamRead, StoreError> {
     let checkpoint = store.checkpoint(&stream.name).await?;
     let last_ok = checkpoint.last_success_at;
+    // Counts runs that never finished, unlike `last_run`, so an interrupted
+    // first run is not mistaken for one that never started.
+    let first_run = store.first_run_at(&stream.name).await?;
 
     let attain = match stream.freshness {
         Some(freshness) => {
             // A stream is only accountable for the time it has existed:
             // scoring one that started an hour ago against seven days would
             // report a perfectly healthy stream as a near-total failure.
-            let first_run = store.first_run_at(&stream.name).await?;
             let from = first_run.map_or(window_start, |at| at.max(window_start));
 
             // Coverage bought just before the window still counts inside it,
@@ -235,6 +239,7 @@ async fn read_stream(
         last_ok,
         attain,
         quarantined: store.quarantined_count(&stream.name).await?,
+        ran: first_run.is_some(),
         last_status: last_run.and_then(|run| run.status),
     })
 }
@@ -300,6 +305,7 @@ fn describe_state(
     freshness: Option<Duration>,
     lag: Option<Duration>,
     quarantined: u32,
+    ran: bool,
     last_status: Option<&str>,
 ) -> String {
     if quarantined > 0 {
@@ -311,7 +317,14 @@ fn describe_state(
     match (freshness, lag) {
         (None, _) if priority == Priority::BestEffort => "backfilling (surplus)".to_owned(),
         (None, _) => "no target".to_owned(),
-        (Some(_), None) => "never run".to_owned(),
+        // No success yet: say whether anything ran at all. A run with no
+        // status is still going, or was killed before it could record one.
+        (Some(_), None) => match (ran, last_status) {
+            (false, _) => "never run",
+            (true, None) => "in progress or interrupted",
+            (true, Some(_)) => "no successful run yet",
+        }
+        .to_owned(),
         (Some(target), Some(lag)) if lag > target => {
             format!("BREACH: {} past target", format_duration(lag - target))
         }
