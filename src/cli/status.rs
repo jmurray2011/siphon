@@ -340,6 +340,7 @@ mod tests {
             Some(Duration::from_secs(900)),
             Some(Duration::from_secs(1_200)),
             0,
+            true,
             Some("ok"),
         );
         assert_eq!(state, "BREACH: 5m00s past target");
@@ -352,6 +353,7 @@ mod tests {
             Some(Duration::from_secs(900)),
             Some(Duration::from_secs(120)),
             0,
+            true,
             Some("ok"),
         );
         assert_eq!(state, "ok");
@@ -364,6 +366,7 @@ mod tests {
             Some(Duration::from_secs(900)),
             Some(Duration::from_secs(10)),
             2,
+            true,
             Some("partial"),
         );
         assert_eq!(state, "PARTIAL: 2 page(s) quarantined");
@@ -376,6 +379,7 @@ mod tests {
             None,
             Some(Duration::from_secs(9_999)),
             0,
+            true,
             Some("ok"),
         );
         assert_eq!(state, "backfilling (surplus)");
@@ -388,9 +392,36 @@ mod tests {
             Some(Duration::from_secs(60)),
             None,
             0,
+            false,
             None,
         );
         assert_eq!(state, "never run");
+    }
+
+    #[test]
+    fn an_unfinished_run_is_not_reported_as_never_run() {
+        let state = describe_state(
+            Priority::Normal,
+            Some(Duration::from_secs(60)),
+            None,
+            0,
+            true,
+            None,
+        );
+        assert_eq!(state, "in progress or interrupted");
+    }
+
+    #[test]
+    fn finished_runs_without_a_success_say_so() {
+        let state = describe_state(
+            Priority::Normal,
+            Some(Duration::from_secs(60)),
+            None,
+            0,
+            true,
+            Some("partial"),
+        );
+        assert_eq!(state, "no successful run yet");
     }
 
     #[test]
