@@ -500,3 +500,8 @@ The core is deterministic and I/O-free - `clock`, `config`, `pagination`,
 `budget`, `governor`, `extract` - with `http` and `store` as the only adapters.
 Time is reached only through `clock::Clock`, so scheduling behaviour is tested by
 simulation rather than by sleeping.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
