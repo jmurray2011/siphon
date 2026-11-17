@@ -66,12 +66,11 @@ Priority biases the ordering; it does not create castes. Deficit grows without
 bound, so a `low` stream that is badly late eventually outranks a `high` stream
 that is barely late - it still got served four times above.
 
-## Does the premise hold?
+## Rate-limit signals by API
 
-The whole design rests on `(remaining, reset_at)` being readable reliably enough
-to pace against. If it is not, the governor degrades to a static token bucket and
-there is no reason for siphon to exist. Surveyed against live unauthenticated
-responses on 2026-08-01, captured as fixtures in
+siphon paces against `(remaining, reset_at)` when an API publishes them, and
+falls back to the configured ceiling when it does not. Measured against live
+unauthenticated responses on 2026-08-01; the captures are fixtures in
 [`tests/real_world_headers.rs`](tests/real_world_headers.rs):
 
 | API | Fields | Reset | Window | Verdict |
@@ -82,41 +81,25 @@ responses on 2026-08-01, captured as fixtures in
 | crates.io | none | - | - | No signal at all |
 | PyPI | none (but sends `ETag`) | - | - | No signal at all |
 
-Three things fell out of this that were not obvious from the design:
+How siphon handles each case:
 
-**Window length varies by two orders of magnitude.** GitHub's window is an hour;
-GitLab's is a minute. Both are read correctly from the same auto-detected fields,
-but they produce very different pacing - 0.013 req/s against GitHub versus about
-17 req/s against GitLab - and the window estimator has to converge on each
-without being told which it is looking at.
+- **Window length is read, not configured.** GitHub's window is an hour and
+  GitLab's a minute; both come from the same parse. Pacing ranges from about
+  0.013 req/s (GitHub) to 17 req/s (GitLab) with no per-API setting.
+- **No signal: the configured ceiling is the budget.** For APIs that publish
+  nothing, `requests_per_hour` is the limit, and the politeness floor applies
+  when that is unset too.
+- **A 304 is not always free.** GitHub does not charge for one; Bitbucket
+  charges the same as a 200. Conditional requests always save bandwidth, but on
+  Bitbucket a freshness target has to be affordable on request count alone.
+- **Disagreeing counters are clamped.** Bitbucket answers from several nodes
+  whose counters disagree (55, 57, 59, 54 within two seconds). Within a window
+  siphon only ever lowers its estimate of what is left, and restores it only
+  when the window has elapsed.
 
-**A configured ceiling is not a fallback, it is a primary path.** Two of the five
-APIs surveyed publish nothing at all. `requests_per_hour` is the only signal
-there, and the politeness floor is what protects an API that has neither.
-Conditional requests are independent of this: PyPI publishes no budget but does
-publish an `ETag`, so polling it is still cheap. Independent in the other
-direction too, and this one is easy to get wrong - a 304 is not automatically
-free. GitHub does not charge for one, which is what makes a tight freshness
-target affordable there. Bitbucket decrements the same counter it would for a
-200, so conditional requests buy bandwidth and not budget, and a target has to
-be affordable on request count alone.
-
-**A published counter is not necessarily a counter.** Bitbucket answers from
-several nodes whose rate-limit counters disagree. Eight requests inside two
-seconds read 55, 57, 59, 54, 59, 59, 58, 58, and a single node reported 57, then
-54, then 58 - so the newest value is not the truest one, and taking it verbatim
-lets the stalest node hand back an allowance that was already spent. Within a
-window siphon now only ever lowers what it believes is left, and restores it
-only once that window has actually elapsed. The categories are therefore not
-"publishes" and "does not publish" but three: publishes something you can pace
-against, publishes nothing, and publishes something that will mislead you if you
-believe it. The last is the one worth designing for, because it looks like the
-first.
-
-Worth noting for later: GitHub's `X-RateLimit-Resource: core` names the bucket
-the limit belongs to, and `/search` is a separate bucket on the same token. The
-budget model here assumes one pool per source, so a config that mixes them would
-measure one and spend both.
+**Limitation:** the budget model is one pool per source. GitHub's `/search` is
+a separate bucket on the same token (`X-RateLimit-Resource`), so a source that
+mixes `/search` with other endpoints measures one bucket and spends from both.
 
 ---
 
