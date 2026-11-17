@@ -773,6 +773,28 @@ streams:
     }
 
     #[test]
+    fn an_absolute_url_on_another_origin_is_refused() {
+        // A next URL comes from the response, and the request built from it
+        // carries this source's credentials. Following it to another host,
+        // scheme or port would hand those credentials to whoever answered.
+        let (client, stream) = client_and_stream();
+        for foreign in [
+            "https://elsewhere.example.net/v2/items?page=2",
+            "http://api.example.com/v2/items?page=2",
+            "https://api.example.com:8443/v2/items?page=2",
+        ] {
+            let page = PageRequest {
+                params: Vec::new(),
+                absolute_url: Some(foreign.to_owned()),
+            };
+            let err = client
+                .url_for(&stream, &page, None)
+                .expect_err("cross-origin URL must be refused");
+            assert!(matches!(err, HttpError::ForeignOrigin { .. }), "{foreign}");
+        }
+    }
+
+    #[test]
     fn a_missing_credential_fails_before_any_request() {
         let text = CONFIG.replace("value: secret-value", "value: ${SIPHON_TEST_UNSET_KEY}");
         let config = Config::parse(&text).expect("config is valid");

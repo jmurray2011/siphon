@@ -572,6 +572,7 @@ mod tests {
             cursor_path: None,
             rel: None,
             url_path: None,
+            end_path: None,
             max_pages: None,
             stop_on_empty: None,
             stop_on_seen_key: None,
@@ -830,12 +831,136 @@ mod tests {
     }
 
     #[test]
-    fn next_url_is_reserved_but_not_implemented() {
+    fn next_url_requires_url_path() {
         let err = Paginator::from_config(&cfg(StrategyKind::NextUrl)).unwrap_err();
         assert!(matches!(
             err,
-            PaginationConfigError::Unsupported("next_url")
+            PaginationConfigError::MissingField {
+                strategy: "next_url",
+                field: "url_path"
+            }
         ));
+    }
+
+    fn next_url(end_path: Option<&str>) -> Paginator {
+        let mut c = cfg(StrategyKind::NextUrl);
+        c.url_path = Some("$.next_page".into());
+        c.end_path = end_path.map(Into::into);
+        Paginator::from_config(&c).unwrap()
+    }
+
+    #[test]
+    fn next_url_follows_the_body_url_as_an_absolute_request() {
+        let p = next_url(None);
+        assert_eq!(p.initial(), PageState::Start);
+        assert!(p.reserved_params().is_empty());
+
+        let body = json!({ "next_page": "https://api.example.com/items?start=2" });
+        let next = p.advance(&PageState::Start, &outcome(10, &body, None), 1);
+        assert_eq!(
+            next,
+            Advance::Next(PageState::Url {
+                url: "https://api.example.com/items?start=2".to_owned()
+            })
+        );
+
+        let state = PageState::Url {
+            url: "https://api.example.com/items?start=2".to_owned(),
+        };
+        let req = p.request_for(&state);
+        assert_eq!(
+            req.absolute_url.as_deref(),
+            Some("https://api.example.com/items?start=2")
+        );
+        assert!(req.params.is_empty());
+    }
+
+    #[test]
+    fn next_url_stops_when_the_url_is_absent_null_or_empty() {
+        let p = next_url(None);
+        for body in [
+            json!({}),
+            json!({ "next_page": null }),
+            json!({ "next_page": "" }),
+        ] {
+            assert_eq!(
+                p.advance(&PageState::Start, &outcome(10, &body, None), 1),
+                Advance::Done(StopReason::NoNextUrl)
+            );
+        }
+    }
+
+    #[test]
+    fn next_url_stops_on_the_end_flag_even_with_a_url_present() {
+        // Time-based exports keep handing out a next URL on the last page so the
+        // next run knows where to resume; a flag in the body says this walk is done.
+        let p = next_url(Some("$.end_of_stream"));
+        let last = json!({
+            "next_page": "https://api.example.com/items?start=9",
+            "end_of_stream": true
+        });
+        assert_eq!(
+            p.advance(&PageState::Start, &outcome(10, &last, None), 1),
+            Advance::Done(StopReason::EndOfStream)
+        );
+
+        let more = json!({
+            "next_page": "https://api.example.com/items?start=9",
+            "end_of_stream": false
+        });
+        assert!(matches!(
+            p.advance(&PageState::Start, &outcome(10, &more, None), 1),
+            Advance::Next(PageState::Url { .. })
+        ));
+    }
+
+    #[test]
+    fn next_url_stops_rather_than_refetch_the_same_url() {
+        let p = next_url(None);
+        let url = "https://api.example.com/items?start=5".to_owned();
+        let body = json!({ "next_page": url });
+        assert_eq!(
+            p.advance(&PageState::Url { url: url.clone() }, &outcome(10, &body, None), 2),
+            Advance::Done(StopReason::RepeatedUrl)
+        );
+    }
+
+    #[test]
+    fn next_url_rejects_a_bad_end_path() {
+        let mut c = cfg(StrategyKind::NextUrl);
+        c.url_path = Some("$.next_page".into());
+        c.end_path = Some("not a path".into());
+        assert!(matches!(
+            Paginator::from_config(&c).unwrap_err(),
+            PaginationConfigError::BadPath {
+                field: "end_path",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn end_path_is_only_for_next_url() {
+        let mut c = cfg(StrategyKind::Page);
+        c.end_path = Some("$.done".into());
+        assert!(matches!(
+            Paginator::from_config(&c).unwrap_err(),
+            PaginationConfigError::NotApplicable {
+                strategy: "page",
+                field: "end_path"
+            }
+        ));
+    }
+
+    #[test]
+    fn a_next_url_walk_cannot_step_over_a_poisoned_page() {
+        let p = next_url(None);
+        assert_eq!(
+            p.skip(&PageState::Url {
+                url: "https://x/2".to_owned()
+            }),
+            None
+        );
     }
 
     #[test]
