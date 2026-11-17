@@ -81,6 +81,11 @@ pub struct PaginationConfig {
     /// `next_url`: JSONPath to a full URL in the response body.
     #[serde(default)]
     pub url_path: Option<String>,
+    /// `next_url`: JSONPath to a boolean in the body; `true` ends the walk even
+    /// when a next URL is present. Time-based exports keep handing out a next
+    /// URL on their last page so a later run knows where to resume.
+    #[serde(default)]
+    pub end_path: Option<String>,
 
     /// Hard cap on pages per run. Default 10,000.
     #[serde(default)]
@@ -91,6 +96,21 @@ pub struct PaginationConfig {
     /// Stop when a record already in the store is seen. Default false.
     #[serde(default)]
     pub stop_on_seen_key: Option<bool>,
+}
+
+impl StrategyKind {
+    /// The name as written in YAML.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Offset => "offset",
+            Self::Page => "page",
+            Self::Cursor => "cursor",
+            Self::LinkHeader => "link_header",
+            Self::NextUrl => "next_url",
+            Self::None => "none",
+        }
+    }
 }
 
 /// A validated pagination strategy with only the fields it actually uses.
@@ -114,6 +134,10 @@ enum Strategy {
     },
     LinkHeader {
         rel: String,
+    },
+    NextUrl {
+        url_path: JsonPath,
+        end_path: Option<JsonPath>,
     },
     Single,
 }
@@ -153,9 +177,14 @@ pub enum PaginationConfigError {
         /// Which field was zero.
         field: &'static str,
     },
-    /// The strategy is reserved but not implemented in this version.
-    #[error("pagination strategy `{0}` is not implemented in v0.1")]
-    Unsupported(&'static str),
+    /// A field was supplied that the chosen strategy does not use.
+    #[error("pagination `{field}` does not apply to strategy `{strategy}`")]
+    NotApplicable {
+        /// The strategy that was chosen.
+        strategy: &'static str,
+        /// The field it does not use.
+        field: &'static str,
+    },
 }
 
 impl Paginator {
@@ -166,6 +195,12 @@ impl Paginator {
     /// Fails when a field the strategy requires is missing, a JSONPath does not
     /// parse, or a size is zero.
     pub fn from_config(cfg: &PaginationConfig) -> Result<Self, PaginationConfigError> {
+        if cfg.end_path.is_some() && cfg.strategy != StrategyKind::NextUrl {
+            return Err(PaginationConfigError::NotApplicable {
+                strategy: cfg.strategy.as_str(),
+                field: "end_path",
+            });
+        }
         let strategy = match cfg.strategy {
             StrategyKind::Offset => {
                 let page_size = cfg.page_size.ok_or(PaginationConfigError::MissingField {
@@ -210,7 +245,15 @@ impl Paginator {
             StrategyKind::LinkHeader => Strategy::LinkHeader {
                 rel: cfg.rel.clone().unwrap_or_else(|| "next".into()),
             },
-            StrategyKind::NextUrl => return Err(PaginationConfigError::Unsupported("next_url")),
+            StrategyKind::NextUrl => Strategy::NextUrl {
+                url_path: parse_path(cfg.url_path.as_deref(), "url_path")?.ok_or({
+                    PaginationConfigError::MissingField {
+                        strategy: "next_url",
+                        field: "url_path",
+                    }
+                })?,
+                end_path: parse_path(cfg.end_path.as_deref(), "end_path")?,
+            },
             StrategyKind::None => Strategy::Single,
         };
 
@@ -228,9 +271,10 @@ impl Paginator {
         match &self.strategy {
             Strategy::Offset { .. } => PageState::Offset { offset: 0 },
             Strategy::Page { start_page, .. } => PageState::Page { page: *start_page },
-            Strategy::Cursor { .. } | Strategy::LinkHeader { .. } | Strategy::Single => {
-                PageState::Start
-            }
+            Strategy::Cursor { .. }
+            | Strategy::LinkHeader { .. }
+            | Strategy::NextUrl { .. }
+            | Strategy::Single => PageState::Start,
         }
     }
 
@@ -258,7 +302,7 @@ impl Paginator {
                 names
             }
             Strategy::Cursor { cursor_param, .. } => vec![cursor_param.as_str()],
-            Strategy::LinkHeader { .. } | Strategy::Single => Vec::new(),
+            Strategy::LinkHeader { .. } | Strategy::NextUrl { .. } | Strategy::Single => Vec::new(),
         }
     }
 
@@ -414,6 +458,28 @@ impl Paginator {
                     None => Advance::Done(StopReason::NoLink),
                 }
             }
+
+            Strategy::NextUrl { url_path, end_path } => {
+                let ended = end_path
+                    .as_ref()
+                    .is_some_and(|path| path.query(page.body).first() == Some(&Value::Bool(true)));
+                if ended {
+                    return Advance::Done(StopReason::EndOfStream);
+                }
+                let next = url_path.query(page.body).first().and_then(|v| match v {
+                    Value::String(s) if !s.is_empty() => Some(s.clone()),
+                    _ => None,
+                });
+                match next {
+                    // An upstream that answers with the URL it was just asked for
+                    // would otherwise be walked until `max_pages`.
+                    Some(url) if matches!(state, PageState::Url { url: current } if *current == url) => {
+                        Advance::Done(StopReason::RepeatedUrl)
+                    }
+                    Some(url) => Advance::Next(PageState::Url { url }),
+                    None => Advance::Done(StopReason::NoNextUrl),
+                }
+            }
         }
     }
 }
@@ -519,6 +585,12 @@ pub enum StopReason {
     NoCursor,
     /// The response carried no matching `Link` rel.
     NoLink,
+    /// The response body carried no next URL.
+    NoNextUrl,
+    /// The response body flagged the end of the stream.
+    EndOfStream,
+    /// The response pointed back at the URL just fetched.
+    RepeatedUrl,
     /// A record already in the store was seen.
     SeenKey,
     /// The reported total page count was reached.
@@ -538,6 +610,9 @@ impl StopReason {
             Self::ShortPage => "short_page",
             Self::NoCursor => "no_cursor",
             Self::NoLink => "no_link",
+            Self::NoNextUrl => "no_next_url",
+            Self::EndOfStream => "end_of_stream",
+            Self::RepeatedUrl => "repeated_url",
             Self::SeenKey => "seen_key",
             Self::TotalPages => "total_pages",
             Self::MaxPages => "max_pages",
@@ -920,7 +995,11 @@ mod tests {
         let url = "https://api.example.com/items?start=5".to_owned();
         let body = json!({ "next_page": url });
         assert_eq!(
-            p.advance(&PageState::Url { url: url.clone() }, &outcome(10, &body, None), 2),
+            p.advance(
+                &PageState::Url { url: url.clone() },
+                &outcome(10, &body, None),
+                2
+            ),
             Advance::Done(StopReason::RepeatedUrl)
         );
     }

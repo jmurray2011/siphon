@@ -57,6 +57,14 @@ pub enum HttpError {
         /// What went wrong.
         cause: String,
     },
+    /// An upstream-supplied next URL points outside the source's origin.
+    #[error("stream `{stream}` was handed a next URL on another origin ({origin}); refusing to send credentials there")]
+    ForeignOrigin {
+        /// The stream whose walk it was.
+        stream: String,
+        /// The origin the URL pointed at. The path and query are left out.
+        origin: String,
+    },
 }
 
 /// How a response is treated. See the design's response classification table.
@@ -239,6 +247,12 @@ impl SourceClient {
                 stream: stream.name.clone(),
                 cause: e.to_string(),
             })?;
+            if url.origin() != self.source.base_url.origin() {
+                return Err(HttpError::ForeignOrigin {
+                    stream: stream.name.clone(),
+                    origin: url.origin().ascii_serialization(),
+                });
+            }
             self.apply_query_auth(&mut url);
             return Ok(url);
         }

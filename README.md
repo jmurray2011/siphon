@@ -330,11 +330,19 @@ a silent fallback.
 | `page` | none; optional `page_param`, `size_param`, `page_size`, `start_page`, `total_pages_path` | short page when `page_size` is set, empty page, or the reported total |
 | `cursor` | `cursor_param`, `cursor_path` | cursor absent, null or empty |
 | `link_header` | none; optional `rel` (default `next`) | header absent |
+| `next_url` | `url_path`; optional `end_path` | URL absent, null or empty; `end_path` true; or the same URL handed back |
 | `none` | none | one request |
 
 Cross-cutting on every strategy: `max_pages` (default 10,000), `stop_on_empty`
 (default true), `stop_on_seen_key` (default false, and linted - it is wrong for
 APIs that update records in place without moving them in sort order).
+
+A next URL from a `Link` header or a `next_url` body field is followed only on
+the source's own origin (scheme, host and port of `base_url`). A next URL that
+points anywhere else ends the run with an error rather than send the source's
+credentials there. `end_path` is for time-based exports that hand out a next
+URL on their last page too, so a later run knows where to resume: point it at
+the body's end-of-stream flag.
 
 A parameter the strategy sets for itself - or one that `cursor.param` owns - wins
 over a `request.params` entry of the same name, and `validate` lints the
@@ -434,7 +442,7 @@ FROM _siphon_runs ORDER BY id DESC LIMIT 20;
 ## Not in v0.1
 
 Reserved in the config format, rejected with a clear error if used:
-`strategy: next_url`, `write.mode: append | replace`, `write.soft_delete`,
+`write.mode: append | replace`, `write.soft_delete`,
 parent/child streams, OAuth2, and the `schedule:` cron escape hatch. The typed
 projection (a real `issues` table alongside the raw layer), schema-drift
 handling, `siphon infer`, `siphon status --advise` and the dead-letter table are
