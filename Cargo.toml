@@ -20,7 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 # Pinned below 0.40: its libsqlite3-sys build script uses `cfg_select`, which
 # needs a newer rustc than the 1.92 this is built against. `bundled` is what
 # makes the single-binary promise hold - no libsqlite3 on the host.
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 # Pinned to the `ring` provider. rustls defaults to `aws-lc-rs`, which needs a C
 # toolchain and would break the static musl build and the no-C-dependency rule.
 # reqwest already builds rustls with ring, so this shares one stack rather than
