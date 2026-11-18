@@ -80,8 +80,20 @@ impl Timestamp {
 
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match chrono::DateTime::from_timestamp_millis(self.0) {
-            Some(dt) => write!(f, "{}", dt.to_rfc3339()),
+        // RFC 3339 in UTC, with milliseconds only when there are any.
+        let pattern = if self.0.rem_euclid(1000) == 0 {
+            "%Y-%m-%dT%H:%M:%S%:z"
+        } else {
+            "%Y-%m-%dT%H:%M:%S%.3f%:z"
+        };
+        let text = jiff::Timestamp::from_millisecond(self.0)
+            .ok()
+            .and_then(|at| {
+                jiff::fmt::strtime::format(pattern, &at.to_zoned_datetime(jiff::tz::TimeZone::UTC))
+                    .ok()
+            });
+        match text {
+            Some(text) => f.write_str(&text),
             None => write!(f, "{}ms", self.0),
         }
     }

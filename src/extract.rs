@@ -215,11 +215,11 @@ impl RecordSpec {
                                 kind: c.kind.as_str(),
                             });
                         }
-                        // chrono panics when formatting with a bad pattern, so
-                        // the pattern is checked here rather than mid-run.
-                        if chrono::format::StrftimeItems::new(pattern)
-                            .any(|item| matches!(item, chrono::format::Item::Error))
-                        {
+                        // A bad pattern is caught here rather than mid-run, where
+                        // it would silently fall back to the raw mark.
+                        let probe =
+                            jiff::Timestamp::UNIX_EPOCH.to_zoned_datetime(jiff::tz::TimeZone::UTC);
+                        if jiff::fmt::strtime::format(pattern, &probe).is_err() {
                             return Err(RecordSpecError::BadFormat {
                                 pattern: pattern.clone(),
                             });
@@ -417,7 +417,9 @@ impl CursorValue {
     #[must_use]
     pub fn parse(raw: &str, kind: CursorKind) -> Option<Self> {
         let ord = match kind {
-            CursorKind::Rfc3339 => CursorOrd::Num(parse_timestamp(raw)?.timestamp_millis()),
+            CursorKind::Rfc3339 => {
+                CursorOrd::Num(parse_timestamp(raw)?.timestamp().as_millisecond())
+            }
             CursorKind::UnixSeconds => CursorOrd::Num(raw.parse::<i64>().ok()?.checked_mul(1_000)?),
             CursorKind::UnixMillis | CursorKind::Integer => CursorOrd::Num(raw.parse().ok()?),
             CursorKind::String => CursorOrd::Text(raw.to_owned()),
@@ -458,15 +460,17 @@ impl CursorValue {
         };
         match spec.kind() {
             CursorKind::Rfc3339 => parse_timestamp(&self.raw)
-                .map(|at| at.format(pattern).to_string())
+                .and_then(|at| jiff::fmt::strtime::format(pattern, &at).ok())
                 .unwrap_or_else(|| self.raw.clone()),
             CursorKind::UnixSeconds | CursorKind::UnixMillis => {
                 let millis = match self.ord {
                     CursorOrd::Num(millis) => millis,
                     CursorOrd::Text(_) => return self.raw.clone(),
                 };
-                chrono::DateTime::from_timestamp_millis(millis)
-                    .map(|at| at.format(pattern).to_string())
+                jiff::Timestamp::from_millisecond(millis)
+                    .ok()
+                    .map(|at| at.to_zoned_datetime(jiff::tz::TimeZone::UTC))
+                    .and_then(|at| jiff::fmt::strtime::format(pattern, &at).ok())
                     .unwrap_or_else(|| self.raw.clone())
             }
             CursorKind::Integer | CursorKind::String => self.raw.clone(),
@@ -479,14 +483,25 @@ impl CursorValue {
 ///
 /// `2021-05-04T22:10:32.221+0100` is not RFC 3339 - the offset needs a colon -
 /// but Jira, Confluence and a long tail of Java stacks send exactly that.
-fn parse_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
-    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(raw) {
-        return Some(at);
-    }
-    const FALLBACKS: [&str; 2] = ["%Y-%m-%dT%H:%M:%S%.f%z", "%Y-%m-%d %H:%M:%S%.f%z"];
-    FALLBACKS
-        .iter()
-        .find_map(|format| chrono::DateTime::parse_from_str(raw, format).ok())
+///
+/// The result keeps the offset the timestamp arrived in, so re-rendering it
+/// does not shift the wall-clock time.
+fn parse_timestamp(raw: &str) -> Option<jiff::ZonedDateTime> {
+    const FORMATS: [&str; 4] = [
+        "%Y-%m-%dT%H:%M:%S%.f%:z",
+        "%Y-%m-%dT%H:%M:%S%.fZ",
+        "%Y-%m-%dT%H:%M:%S%.f%z",
+        "%Y-%m-%d %H:%M:%S%.f%z",
+    ];
+    FORMATS.iter().find_map(|format| {
+        let parsed = jiff::fmt::strtime::parse(format, raw).ok()?;
+        let offset = parsed.offset().unwrap_or(jiff::tz::Offset::UTC);
+        parsed
+            .to_datetime()
+            .ok()?
+            .to_zoned_datetime(jiff::tz::TimeZone::fixed(offset))
+            .ok()
+    })
 }
 
 #[cfg(test)]
@@ -772,8 +787,8 @@ mod tests {
 
     #[test]
     fn a_bad_strftime_pattern_is_caught_at_load_not_mid_run() {
-        // chrono panics when formatting with a bad pattern, so this has to fail
-        // before a run rather than during one.
+        // A pattern the formatter rejects has to fail before a run rather than
+        // during one.
         let err = RecordSpec::from_config(&RecordsConfig {
             path: "$".to_owned(),
             primary_key: "$.id".to_owned(),
@@ -781,7 +796,7 @@ mod tests {
                 field: "$.updated".to_owned(),
                 kind: CursorKind::Rfc3339,
                 param: None,
-                format: Some("%Q".to_owned()),
+                format: Some("%J".to_owned()),
                 initial: None,
             }),
         })

@@ -224,14 +224,18 @@ fn parse_http_date(raw: &str) -> Option<Timestamp> {
         "%A, %d-%b-%y %H:%M:%S GMT",
         "%a %b %e %H:%M:%S %Y",
     ];
-    for format in FORMATS {
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, format) {
-            return Some(Timestamp::from_millis(naive.and_utc().timestamp_millis()));
-        }
-    }
-    chrono::DateTime::parse_from_rfc2822(trimmed)
-        .ok()
-        .map(|dt| Timestamp::from_millis(dt.timestamp_millis()))
+    let at = FORMATS
+        .iter()
+        .find_map(|format| {
+            jiff::fmt::strtime::parse(format, trimmed)
+                .ok()?
+                .to_datetime()
+                .ok()?
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                .ok()
+        })
+        .or_else(|| jiff::fmt::rfc2822::parse(trimmed).ok())?;
+    Some(Timestamp::from_millis(at.timestamp().as_millisecond()))
 }
 
 #[cfg(test)]
