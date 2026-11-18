@@ -421,7 +421,14 @@ impl<S: SyncStore> SyncWorker<S> {
             .zip(checkpoint.cursor_val.as_deref())
             .and_then(|(spec, raw)| CursorValue::parse(raw, spec.kind()));
 
-        let mut conditional = resumed.is_none();
+        // Only the first page is ever sent conditionally, so a 304 has to
+        // speak for the whole walk. It does when that page is the whole answer:
+        // an incremental request ("everything since the mark") or a stream
+        // with no pagination. On a full walk across several pages it does not:
+        // new records can land on a later page while page one stays unchanged.
+        let incremental = stream.is_incremental() && stream.records.cursor().is_some();
+        let mut conditional =
+            resumed.is_none() && (incremental || stream.paginator.is_single_request());
         let mut truncated = false;
         let mut consecutive_quarantines = 0u32;
 

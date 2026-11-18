@@ -312,6 +312,12 @@ impl Paginator {
         self.stop_on_seen_key
     }
 
+    /// Whether every record comes back in a single request.
+    #[must_use]
+    pub const fn is_single_request(&self) -> bool {
+        matches!(self.strategy, Strategy::Single)
+    }
+
     /// How this state turns into an actual request.
     #[must_use]
     pub fn request_for(&self, state: &PageState) -> PageRequest {

@@ -78,6 +78,13 @@ How siphon handles each case:
 - **A 304 is not always free.** GitHub does not charge for one; Bitbucket
   charges the same as a 200. Conditional requests always save bandwidth, but on
   Bitbucket a freshness target has to be affordable on request count alone.
+- **Only a first page that is the whole answer is polled conditionally.**
+  siphon sends `If-None-Match` on the first page of a walk and treats a 304 as
+  "the stream is unchanged". That holds for an incremental stream, whose first
+  page is everything since the mark, and for a stream with no pagination. It
+  does not hold for a full walk over several pages, where new records can land
+  on a later page while the first stays the same, so those streams always
+  walk.
 - **Disagreeing counters are clamped.** Bitbucket answers from several nodes
   whose counters disagree (55, 57, 59, 54 within two seconds). Within a window
   siphon only ever lowers its estimate of what is left, and restores it only
