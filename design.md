@@ -597,7 +597,7 @@ Before building any of it: take two real APIs with different header conventions 
 |---|---|---|
 | Async runtime | `tokio` | Non-negotiable, everything downstream assumes it |
 | HTTP | `reqwest` + `rustls` | No OpenSSL, so static musl builds actually work |
-| Config | `serde_yaml` + `serde` | Typed structs, real errors |
+| Config | `serde-saphyr` + `serde` | Typed structs, real errors, pure Rust |
 | SQLite | `rusqlite` (bundled) | Vendored C, one binary, no system libsqlite |
 | JSONPath | `serde_json_path` | RFC 9535 compliant; avoid the older ad-hoc crates |
 | Scheduling | `tokio-cron-scheduler` or hand-rolled intervals | Evaluate; hand-rolled may be less than the dependency costs |
