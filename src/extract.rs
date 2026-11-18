@@ -735,6 +735,22 @@ mod tests {
     }
 
     #[test]
+    fn a_timestamp_mark_can_be_sent_as_epoch_seconds() {
+        // Zendesk emits RFC 3339 but accepts `start_time` only as an epoch.
+        let spec = cursor_spec(CursorKind::Rfc3339, Some("%s"));
+        let value =
+            CursorValue::parse("2021-05-04T22:10:32.221+0100", CursorKind::Rfc3339).unwrap();
+        assert_eq!(value.render(&spec), "1620162632");
+    }
+
+    #[test]
+    fn unix_millis_cursors_render_in_utc() {
+        let spec = cursor_spec(CursorKind::UnixMillis, Some("%Y-%m-%d %H:%M"));
+        let value = CursorValue::parse("1620162632221", CursorKind::UnixMillis).unwrap();
+        assert_eq!(value.render(&spec), "2021-05-04 21:10");
+    }
+
+    #[test]
     fn a_format_on_a_non_timestamp_cursor_is_refused() {
         let err = RecordSpec::from_config(&RecordsConfig {
             path: "$".to_owned(),

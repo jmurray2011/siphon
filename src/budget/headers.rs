@@ -326,6 +326,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_every_http_date_form() {
+        let at = Some(Timestamp::from_millis(784_111_777_000));
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"), at);
+        assert_eq!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT"), at);
+        assert_eq!(parse_http_date("Sun Nov  6 08:49:37 1994"), at);
+        assert_eq!(
+            parse_http_date("Tue, 14 Nov 2023 23:13:20 +0100"),
+            Some(Timestamp::from_secs(1_700_000_000))
+        );
+        assert_eq!(parse_http_date("not a date"), None);
+    }
+
+    #[test]
     fn retry_after_in_the_past_is_zero_not_negative() {
         let h = headers(&[
             ("Date", "Tue, 14 Nov 2023 22:13:20 GMT"),

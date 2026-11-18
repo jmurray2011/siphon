@@ -143,6 +143,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn displays_as_rfc3339_in_utc() {
+        assert_eq!(
+            Timestamp::from_secs(1_700_000_000).to_string(),
+            "2023-11-14T22:13:20+00:00"
+        );
+        assert_eq!(
+            Timestamp::from_millis(1_700_000_000_221).to_string(),
+            "2023-11-14T22:13:20.221+00:00"
+        );
+    }
+
+    #[test]
     fn saturating_since_floors_at_zero() {
         let a = Timestamp::from_secs(100);
         let b = Timestamp::from_secs(150);
