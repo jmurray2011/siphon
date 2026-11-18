@@ -262,7 +262,7 @@ pub enum ConfigError {
     },
     /// The YAML did not parse, or did not match the schema.
     #[error("cannot parse config: {0}")]
-    Parse(#[from] serde_yaml_ng::Error),
+    Parse(#[from] serde_saphyr::Error),
     /// The `version` key named a format siphon does not know.
     #[error("config version {found} is not supported; this build understands version {SUPPORTED_VERSION}")]
     Version {
@@ -398,7 +398,7 @@ impl Config {
     ///
     /// Fails if the YAML does not parse or does not validate.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let raw: RawConfig = serde_yaml_ng::from_str(text)?;
+        let raw: RawConfig = serde_saphyr::from_str(text)?;
         Self::validate(raw)
     }
 
