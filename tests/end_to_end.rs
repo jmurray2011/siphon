@@ -485,6 +485,79 @@ async fn a_not_modified_response_is_free_freshness() {
 }
 
 #[tokio::test]
+async fn a_full_walk_does_not_trust_an_unchanged_first_page() {
+    // A list endpoint whose first page never changes while new records arrive
+    // on later pages: a 304 for page one says nothing about page two.
+    let walks = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&walks);
+    let api = MockApi::spawn(move |request| {
+        let offset: u64 = request
+            .param("offset")
+            .and_then(|o| o.parse().ok())
+            .unwrap_or(0);
+        if offset == 0 {
+            seen.fetch_add(1, Ordering::SeqCst);
+            if request.header("if-none-match") == Some("\"p1\"") {
+                return Reply::status(304).with_header("ETag", "\"p1\"");
+            }
+            return Reply::json(r#"{"data":[{"id":1},{"id":2}]}"#).with_header("ETag", "\"p1\"");
+        }
+        if seen.load(Ordering::SeqCst) < 2 {
+            Reply::json(r#"{"data":[]}"#)
+        } else {
+            Reply::json(r#"{"data":[{"id":3}]}"#)
+        }
+    })
+    .await;
+
+    let fixture = fixture(&api.base_url(), OFFSET_STREAM);
+    let app = app(&fixture).await;
+
+    assert_eq!(sync(&app, "items", false).await.status, RunStatus::Ok);
+    let second = sync(&app, "items", false).await;
+
+    assert_eq!(second.status, RunStatus::Ok, "{second:?}");
+    assert_eq!(app.store.record_count("items").await.expect("count"), 3);
+    assert!(
+        api.requests()
+            .iter()
+            .all(|r| r.header("if-none-match").is_none()),
+        "a multi-page full walk must not poll conditionally"
+    );
+}
+
+#[tokio::test]
+async fn a_single_request_stream_still_polls_conditionally() {
+    let api = MockApi::spawn(|request| {
+        if request.header("if-none-match") == Some("\"v1\"") {
+            return Reply::status(304).with_header("ETag", "\"v1\"");
+        }
+        Reply::json(r#"[{"id":1}]"#).with_header("ETag", "\"v1\"")
+    })
+    .await;
+
+    let fixture = fixture(
+        &api.base_url(),
+        r"  - name: config
+    source: api
+    freshness: 15m
+    request:
+      path: /config
+    pagination:
+      strategy: none
+    records:
+      path: $
+      primary_key: $.id
+",
+    );
+    let app = app(&fixture).await;
+
+    assert_eq!(sync(&app, "config", false).await.status, RunStatus::Ok);
+    let steady = sync(&app, "config", false).await;
+    assert_eq!(steady.status, RunStatus::NotModified, "{steady:?}");
+}
+
+#[tokio::test]
 async fn a_poison_page_is_quarantined_and_the_walk_steps_over_it() {
     let api = MockApi::spawn(|request| {
         let offset: u64 = request
